@@ -1,0 +1,12 @@
+.env
+mediavida-mcp
+
+# Binaries
+mediavida
+mediavida-linux-amd64
+mediavida-mcp
+
+# OAuth/session persistence (contains tokens/cookies)
+oauth.json
+session.json
+webhooks.json

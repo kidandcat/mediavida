@@ -30,17 +30,6 @@ func loadEnvFile() {
 	}
 }
 
-func parseModForums(raw string) []string {
-	var out []string
-	for _, s := range strings.Split(raw, ",") {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 func parseAPITokens() map[string]bool {
 	tokens := make(map[string]bool)
 	raw := os.Getenv("API_TOKENS")
@@ -71,6 +60,7 @@ func main() {
 
 	sessions := NewSessionStore()
 	webhooks := NewWebhookStore()
+	modForums := NewModForumsStore()
 	hub := NewEventHub()
 
 	// Restore MV sessions from disk for all known API tokens
@@ -95,12 +85,8 @@ func main() {
 	telegramBot := NewTelegramBot()
 	telegramBot.Start()
 
-	modForums := parseModForums(os.Getenv("MV_MOD_FORUMS"))
-	if len(modForums) > 0 {
-		log.Printf("Mod polling enabled for subforums: %v", modForums)
-	}
-
-	// Start bubbles poller for SSE/webhook push notifications
+	// Start bubbles poller for SSE/webhook push notifications. Mod-forum
+	// subscriptions are per-user and configured via /mod/forums.
 	poller := NewBubblesPoller(hub, sessions, webhooks, telegramBot, modForums)
 	poller.Start()
 
@@ -115,7 +101,7 @@ func main() {
 
 	// REST API mux — everything here requires Authorization: Bearer <token>.
 	apiMux := http.NewServeMux()
-	RegisterAPIRoutes(apiMux, sessions, webhooks, hub, baseURL)
+	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, baseURL)
 
 	root := http.NewServeMux()
 	root.Handle("/auth/login", publicMux)

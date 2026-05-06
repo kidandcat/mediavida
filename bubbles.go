@@ -23,7 +23,7 @@ type BubblesPoller struct {
 	sessions  *SessionStore
 	webhooks  *WebhookStore
 	telegram  *TelegramBot
-	modForums []string // subforum slugs to poll for mod counters (env MV_MOD_FORUMS)
+	modForums *ModForumsStore // per-mv-user subforum subscriptions
 
 	mu             sync.Mutex
 	stopCh         chan struct{}
@@ -34,7 +34,7 @@ type BubblesPoller struct {
 	refreshCounter int                                       // counts polls to periodically refresh sessions via main page
 }
 
-func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, modForums []string) *BubblesPoller {
+func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, modForums *ModForumsStore) *BubblesPoller {
 	prevMod, prevReports := loadModState()
 	return &BubblesPoller{
 		hub:         hub,
@@ -194,10 +194,14 @@ func (bp *BubblesPoller) check() {
 	})
 }
 
-// checkMod polls the configured mod subforums for this session and fires a
-// Telegram alert when a counter increases (new reports or new mod messages).
+// checkMod polls the subforums this user subscribed to via /mod/forums and
+// fires a Telegram alert when a counter increases (new reports or new mod messages).
 func (bp *BubblesPoller) checkMod(clientID string, s *Session) {
-	if bp.telegram == nil || len(bp.modForums) == 0 {
+	if bp.telegram == nil {
+		return
+	}
+	slugs := bp.modForums.Get(s.Scraper.Username())
+	if len(slugs) == 0 {
 		return
 	}
 
@@ -207,7 +211,7 @@ func (bp *BubblesPoller) checkMod(clientID string, s *Session) {
 		bp.prevMod[clientID] = prevBySlug
 	}
 
-	for _, slug := range bp.modForums {
+	for _, slug := range slugs {
 		current, err := s.Scraper.FetchModBubbles(slug)
 		if err != nil {
 			log.Printf("[mod] fetch failed (%s, /foro/%s): %v", s.Scraper.Username(), slug, err)
@@ -300,7 +304,7 @@ func (bp *BubblesPoller) handleNewReports(clientID, slug string, s *Session, mb 
 
 // dailySummaryLoop sends a daily mod summary at 21:00 Europe/Madrid.
 func (bp *BubblesPoller) dailySummaryLoop() {
-	if bp.telegram == nil || len(bp.modForums) == 0 {
+	if bp.telegram == nil {
 		return
 	}
 	loc, err := time.LoadLocation("Europe/Madrid")
@@ -330,7 +334,11 @@ func (bp *BubblesPoller) sendDailySummary() {
 		if s.Status != "authenticated" || s.Scraper == nil {
 			return
 		}
-		for _, slug := range bp.modForums {
+		slugs := bp.modForums.Get(s.Scraper.Username())
+		if len(slugs) == 0 {
+			return
+		}
+		for _, slug := range slugs {
 			mb, err := s.Scraper.FetchModBubbles(slug)
 			if err != nil {
 				log.Printf("[mod-summary] fetch bubbles failed (%s, /foro/%s): %v",

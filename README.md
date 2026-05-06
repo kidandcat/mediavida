@@ -20,7 +20,6 @@ Environment variables (also loadable from `.env`):
 | `API_TOKENS` | yes | Comma-separated list of allowed Bearer tokens. Each token represents one client and gets its own MV session. |
 | `BASE_URL` | no | Public URL prefix used to build the browser auth flow URL. Defaults to `http://localhost:<addr>`. |
 | `MV_TOTP_SECRET` | no | Base32 TOTP secret for automatic guard re-verification on session expiry. |
-| `MV_MOD_FORUMS` | no | Comma-separated subforum slugs (e.g. `off-topic,general`) to poll for moderation counters. Requires the logged-in MV user to be a mod of those subforums. |
 | `TELEGRAM_BOT_TOKEN` | no | Telegram bot token for mod alerts. |
 | `TELEGRAM_ADMINS` | no | `tg_user_id:mv_username,...` mapping for the Telegram bot. |
 
@@ -401,6 +400,42 @@ If the server detects the MV session has expired and re-login also fails
 (e.g. guard required and no `MV_TOTP_SECRET`), it sends a sentinel payload with
 all counters set to `-1` so your webhook receiver can prompt for re-auth.
 
+### Mod forum subscriptions
+
+Subscribe the authenticated MV user to a subforum so the Telegram bot pings them
+when new reports or mod messages appear there. The user must be a moderator of
+the subforum — `POST` validates this against MV before saving.
+
+#### `GET /mod/forums`
+
+```bash
+curl http://localhost:1234/mod/forums -H "Authorization: Bearer $TOKEN"
+# → {"username":"yourname","forums":["off-topic","general"]}
+```
+
+#### `POST /mod/forums`
+
+```bash
+curl -X POST http://localhost:1234/mod/forums \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"subforum":"off-topic"}'
+# → {"username":"yourname","forums":["off-topic"],"added":true}
+```
+
+Returns `403` if the user is not a moderator of that subforum.
+
+#### `DELETE /mod/forums/{subforum}`
+
+Idempotent — succeeds even if the subforum was not subscribed. Useful for
+cleaning up after losing mod rights.
+
+```bash
+curl -X DELETE http://localhost:1234/mod/forums/off-topic \
+  -H "Authorization: Bearer $TOKEN"
+# → 204 No Content
+```
+
 ### Health
 
 `GET /healthz` → `{"status":"ok"}`. Public-style sanity check (still requires a
@@ -438,9 +473,10 @@ Even with no clients connected, the server runs:
   to disk** every ~10 min, so cookies stay fresh.
 - **Keepalive** every 4h, an extra safety net that visits the home page even if
   bubble polling is failing.
-- **Mod polling** for `MV_MOD_FORUMS` if the user is a moderator there;
+- **Mod polling** for each subforum the user subscribed to via `/mod/forums`.
   Telegram alerts go out for new reports and a daily summary at 21:00
-  Europe/Madrid.
+  Europe/Madrid. State is persisted to `mod_state.json` so a restart never
+  re-alerts on already-seen reports.
 
 ---
 
@@ -453,7 +489,9 @@ Per-client session cookies and credentials live in:
 ~/.config/mediavida-mcp/session-<token>.json                       # Linux
 ```
 
-Webhook configuration is in the same directory under `webhooks.json`.
+Webhook configuration is in the same directory under `webhooks.json`. Mod
+subscriptions live in `mod_forums.json`, the poller's last-seen state is in
+`mod_state.json`, and Telegram chat registrations in `telegram_chats.json`.
 
 ---
 

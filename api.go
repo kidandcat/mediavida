@@ -97,7 +97,7 @@ type webAuthResponse struct {
 }
 
 // RegisterAPIRoutes wires all REST endpoints under the given mux.
-func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *WebhookStore, hub *EventHub, baseURL string) {
+func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *WebhookStore, modForums *ModForumsStore, hub *EventHub, baseURL string) {
 	// --- auth ---
 	mux.HandleFunc("POST /auth/login", func(w http.ResponseWriter, r *http.Request) {
 		var req loginRequest
@@ -519,6 +519,75 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return
 		}
 		webhooks.Remove(scraper.Username())
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// --- mod forums (per-user subforum subscriptions for mod alerts) ---
+	mux.HandleFunc("GET /mod/forums", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"username": scraper.Username(),
+			"forums":   modForums.Get(scraper.Username()),
+		})
+	})
+
+	mux.HandleFunc("POST /mod/forums", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		var req struct {
+			Subforum string `json:"subforum"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		slug := strings.TrimSpace(req.Subforum)
+		if slug == "" {
+			writeError(w, http.StatusBadRequest, "subforum is required")
+			return
+		}
+		// Verify the user is a mod of this subforum before saving.
+		var mb *ModBubbles
+		err := withRelogin(scraper, func() error {
+			res, err := scraper.FetchModBubbles(slug)
+			if err != nil {
+				return err
+			}
+			mb = res
+			return nil
+		})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if mb == nil {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("user %s is not a moderator of /foro/%s", scraper.Username(), slug))
+			return
+		}
+		added := modForums.Add(scraper.Username(), slug)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"username": scraper.Username(),
+			"forums":   modForums.Get(scraper.Username()),
+			"added":    added,
+		})
+	})
+
+	mux.HandleFunc("DELETE /mod/forums/{subforum}", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		slug := r.PathValue("subforum")
+		if slug == "" {
+			writeError(w, http.StatusBadRequest, "subforum is required")
+			return
+		}
+		modForums.Remove(scraper.Username(), slug)
 		w.WriteHeader(http.StatusNoContent)
 	})
 

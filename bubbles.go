@@ -35,6 +35,7 @@ type BubblesPoller struct {
 }
 
 func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, modForums []string) *BubblesPoller {
+	prevMod, prevReports := loadModState()
 	return &BubblesPoller{
 		hub:         hub,
 		sessions:    sessions,
@@ -42,9 +43,18 @@ func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookSt
 		telegram:    telegram,
 		modForums:   modForums,
 		prev:        make(map[string]*Bubbles),
-		prevMod:     make(map[string]map[string]*ModBubbles),
-		prevReports: make(map[string]map[string]map[string]struct{}),
+		prevMod:     prevMod,
+		prevReports: prevReports,
 	}
+}
+
+// persistModState snapshots the mod-tracking maps to disk. Called after any
+// mutation in checkMod / handleNewReports so a restart never re-alerts on
+// reports or messages that were already surfaced. Marshaling runs synchronously
+// on the poll goroutine (race-free); the disk write happens in the background.
+func (bp *BubblesPoller) persistModState() {
+	data := marshalModState(bp.prevMod, bp.prevReports)
+	go writeModState(data)
 }
 
 // Start begins polling bubbles.php in a background goroutine.
@@ -217,6 +227,7 @@ func (bp *BubblesPoller) checkMod(clientID string, s *Session) {
 				s.Scraper.Username(), slug, current.Reports, current.Messages)
 		}
 		prevBySlug[slug] = current
+		bp.persistModState()
 
 		if current.Reports > prevReports {
 			bp.handleNewReports(clientID, slug, s, current)
@@ -269,6 +280,7 @@ func (bp *BubblesPoller) handleNewReports(clientID, slug string, s *Session, mb 
 	}
 
 	bp.prevReports[clientID][slug] = currentKeys
+	bp.persistModState()
 
 	if len(newReports) == 0 {
 		// Counter went up but no new keys (e.g. baseline effect on first ever fetch).

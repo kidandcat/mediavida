@@ -13,7 +13,16 @@ class ThreadScreen extends ConsumerStatefulWidget {
   final String url;
   final String title;
   final int initialPage;
-  const ThreadScreen({super.key, required this.url, this.title = '', this.initialPage = 0});
+  /// When true, open positioned at the newest post (used when entering from
+  /// Favorites). Otherwise the thread opens at the top of the loaded page.
+  final bool jumpToLatest;
+  const ThreadScreen({
+    super.key,
+    required this.url,
+    this.title = '',
+    this.initialPage = 0,
+    this.jumpToLatest = false,
+  });
 
   @override
   ConsumerState<ThreadScreen> createState() => _ThreadScreenState();
@@ -93,8 +102,9 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadUser();
-    // Open on the most recent page, positioned at the newest post (bottom).
-    _load(widget.initialPage, scrollToBottom: true);
+    // Load the most recent page; only jump to the newest post when requested
+    // (e.g. entering from Favorites).
+    _load(widget.initialPage, scrollToBottom: widget.jumpToLatest);
   }
 
   Future<void> _loadUser() async {

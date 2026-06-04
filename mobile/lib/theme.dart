@@ -60,11 +60,11 @@ class MvColors extends ThemeExtension<MvColors> {
   static const dark = MvColors(
     accent: Color(0xFFFC8F22),
     accentHover: Color(0xFFDC5A0B),
-    surfaceHigh: Color(0xFF262B2F),
-    border: Color(0xFF2A3035),
+    surfaceHigh: Color(0xFF343B41),
+    border: Color(0xFF3A434A),
     textSecondary: Color(0xFF8F989E),
     textFaint: Color(0xFF5F696F),
-    unread: Color(0xFFE0651A),
+    unread: Color(0xFFFC8F22),
   );
 
   static const light = MvColors(
@@ -81,9 +81,9 @@ class MvColors extends ThemeExtension<MvColors> {
 /// Mediavida theme. Static color getters resolve against [BuildContext] via the
 /// [MvContext] extension; the legacy const fields below are dark-theme fallbacks.
 class MvTheme {
-  // --- Dark palette (mediavida dark_v7.css) ---
-  static const _darkBg = Color(0xFF101213);
-  static const _darkSurface = Color(0xFF1B1D1F);
+  // --- Dark palette (tuned to user-specified scale) ---
+  static const _darkBg = Color(0xFF1C1F22); // darkest of all
+  static const _darkSurface = Color(0xFF2A3237); // next level (cards, appbar, nav)
   static const _darkText = Color(0xFFECEDEF);
 
   // --- Light palette (mediavida light.css) ---
@@ -95,8 +95,8 @@ class MvTheme {
   static const accent = Color(0xFFFC8F22);
   static const bg = _darkBg;
   static const surface = _darkSurface;
-  static const surfaceHigh = Color(0xFF262B2F);
-  static const unread = Color(0xFFE0651A);
+  static const surfaceHigh = Color(0xFF343B41);
+  static const unread = Color(0xFFFC8F22);
 
   static ThemeData dark() => _build(
         brightness: Brightness.dark,
@@ -126,7 +126,7 @@ class MvTheme {
       brightness: brightness,
     ).copyWith(
       primary: ext.accent,
-      onPrimary: brightness == Brightness.dark ? const Color(0xFF20160A) : Colors.white,
+      onPrimary: brightness == Brightness.dark ? const Color(0xFF1C1F22) : Colors.white,
       secondary: ext.accent,
       surface: surface,
       onSurface: text,
@@ -179,7 +179,7 @@ class MvTheme {
       ),
       floatingActionButtonTheme: FloatingActionButtonThemeData(
         backgroundColor: ext.accent,
-        foregroundColor: brightness == Brightness.dark ? const Color(0xFF20160A) : Colors.white,
+        foregroundColor: brightness == Brightness.dark ? const Color(0xFF1C1F22) : Colors.white,
       ),
       extensions: [ext],
     );

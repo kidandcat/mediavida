@@ -31,23 +31,34 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> {
 
   final _composer = TextEditingController();
   final _composerFocus = FocusNode();
+  final _scroll = ScrollController();
 
   bool _isLiked(Post post) => _likeOverride[post.num] ?? post.liked;
 
   @override
   void initState() {
     super.initState();
-    _load(widget.initialPage);
+    // Open on the most recent page, positioned at the newest post (bottom).
+    _load(widget.initialPage, scrollToBottom: true);
   }
 
   @override
   void dispose() {
     _composer.dispose();
     _composerFocus.dispose();
+    _scroll.dispose();
     super.dispose();
   }
 
-  Future<void> _load(int page) async {
+  void _jumpToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      }
+    });
+  }
+
+  Future<void> _load(int page, {bool scrollToBottom = false}) async {
     final api = ref.read(apiProvider);
     if (api == null) {
       setState(() {
@@ -67,6 +78,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> {
         _page = result;
         _loading = false;
       });
+      if (scrollToBottom) _jumpToBottom();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -117,7 +129,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> {
       setState(() => _replyToNum = 0);
       _snack('Publicado');
       final target = _page?.totalPages ?? 0;
-      await _load(target > 0 ? target : widget.initialPage);
+      await _load(target > 0 ? target : widget.initialPage, scrollToBottom: true);
     } catch (e) {
       _snack(e is MvApiException ? e.message : '$e');
     } finally {
@@ -185,8 +197,26 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> {
           ],
         ),
       ),
-      body: _buildBody(),
-      bottomNavigationBar: page == null ? null : _buildBottomBar(page),
+      // Composer lives in the body (not bottomNavigationBar) so it rises above
+      // the keyboard when typing a reply.
+      body: Column(
+        children: [
+          Expanded(child: _buildBody()),
+          if (page != null) _buildBottomBar(page),
+        ],
+      ),
+    );
+  }
+
+  Widget _pagerBtn(IconData icon, String tooltip, VoidCallback? onPressed) {
+    return IconButton(
+      tooltip: tooltip,
+      icon: Icon(icon),
+      iconSize: 22,
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 40, minHeight: 34),
+      onPressed: onPressed,
     );
   }
 
@@ -202,6 +232,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> {
     return RefreshIndicator(
       onRefresh: () => _load(page.currentPage),
       child: ListView.builder(
+        controller: _scroll,
         padding: const EdgeInsets.only(top: 6, bottom: 16),
         itemCount: page.messages.length,
         itemBuilder: (c, i) => _PostCard(
@@ -229,35 +260,28 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             if (page.totalPages > 1)
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+              SizedBox(
+                height: 34,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    IconButton(
-                      tooltip: 'Primera',
-                      icon: const Icon(Icons.first_page),
-                      onPressed: canPrev ? () => _load(1) : null,
-                    ),
-                    IconButton(
-                      tooltip: 'Anterior',
-                      icon: const Icon(Icons.chevron_left),
-                      onPressed: canPrev ? () => _load(page.currentPage - 1) : null,
-                    ),
+                    _pagerBtn(Icons.first_page, 'Primera', canPrev ? () => _load(1) : null),
+                    _pagerBtn(Icons.chevron_left, 'Anterior',
+                        canPrev ? () => _load(page.currentPage - 1) : null),
                     TextButton(
                       onPressed: _showJumpDialog,
-                      child: Text('${page.currentPage} / ${page.totalPages}'),
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        minimumSize: const Size(0, 34),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: Text('${page.currentPage} / ${page.totalPages}',
+                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
                     ),
-                    IconButton(
-                      tooltip: 'Siguiente',
-                      icon: const Icon(Icons.chevron_right),
-                      onPressed: canNext ? () => _load(page.currentPage + 1) : null,
-                    ),
-                    IconButton(
-                      tooltip: 'Última',
-                      icon: const Icon(Icons.last_page),
-                      onPressed: canNext ? () => _load(page.totalPages) : null,
-                    ),
+                    _pagerBtn(Icons.chevron_right, 'Siguiente',
+                        canNext ? () => _load(page.currentPage + 1) : null),
+                    _pagerBtn(Icons.last_page, 'Última',
+                        canNext ? () => _load(page.totalPages) : null),
                   ],
                 ),
               ),

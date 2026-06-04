@@ -219,7 +219,7 @@ class _ThreadRow extends StatelessWidget {
             Text(timeLabel, style: TextStyle(color: context.mv.textFaint, fontSize: 11.5)),
           if (thread.unreadCount.isNotEmpty) ...[
             const SizedBox(height: 6),
-            MvChip(thread.unreadCount, color: context.mv.unread, fg: context.scheme.onSurface),
+            MvChip(thread.unreadCount, color: context.mv.unread, fg: const Color(0xFF1C1F22)),
           ],
         ],
       ),

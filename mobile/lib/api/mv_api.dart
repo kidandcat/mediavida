@@ -154,6 +154,12 @@ class MvApi {
     return Conversation.fromJson(d);
   }
 
+  /// Send a reply into an existing private-message conversation.
+  Future<void> sendMessage(String id, String text) async {
+    final r = await _dio.post('/messages/$id/reply', data: {'text': text});
+    if (r.statusCode != 200) _fail(r);
+  }
+
   // --- favorites / user content ---
 
   Future<List<ThreadListItem>> favorites() async {

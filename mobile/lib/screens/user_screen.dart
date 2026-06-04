@@ -133,7 +133,7 @@ class _PostTile extends StatelessWidget {
                 ),
               ),
         trailing: item.unreadCount.isNotEmpty
-            ? MvChip(item.unreadCount, color: context.mv.unread)
+            ? MvChip(item.unreadCount, color: context.mv.unread, fg: const Color(0xFF1C1F22))
             : null,
         onTap: () => context.openThread(item.url, title: item.title),
       ),

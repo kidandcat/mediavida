@@ -666,7 +666,8 @@ type ThreadListItem struct {
 func parseThreadList(doc *goquery.Document) []ThreadListItem {
 	var items []ThreadListItem
 	doc.Find("#temas tr").Each(func(i int, sel *goquery.Selection) {
-		a := sel.Find("td.col-th .thread a.h").First()
+		// Bold links (a.hb) mark threads with unread posts; a.h are read.
+		a := sel.Find("td.col-th .thread a.h, td.col-th .thread a.hb").First()
 		title := strings.TrimSpace(a.AttrOr("title", a.Text()))
 		href := a.AttrOr("href", "")
 		if href != "" && !strings.HasPrefix(href, "http") {
@@ -678,13 +679,17 @@ func parseThreadList(doc *goquery.Document) []ThreadListItem {
 		if activity == "" {
 			activity = sel.Find("td.thread-count .rd").First().AttrOr("title", "")
 		}
-		// Unread count: try multiple selectors for the unread badge
+		// Unread count: the badge is span.unread-g > a.unseen-num ("3").
 		unread := strings.TrimSpace(sel.Find(".unseen-num").Text())
 		if unread == "" {
 			unread = strings.TrimSpace(sel.Find(".sp.sp2").Text())
 		}
 		if unread == "" {
 			unread = strings.TrimSpace(sel.Find("a.sp").Text())
+		}
+		// Bold but no explicit count → mark as unread anyway.
+		if unread == "" && a.HasClass("hb") {
+			unread = "new"
 		}
 		if title != "" {
 			items = append(items, ThreadListItem{
@@ -1307,25 +1312,42 @@ func (s *ForumScraper) FetchConversation(id string) (*Conversation, error) {
 	title := strings.TrimSpace(doc.Find("h2").First().Text())
 
 	var msgs []PrivateMessage
-	doc.Find("div.post, div.cf.post").Each(func(i int, sel *goquery.Selection) {
-		author := sel.AttrOr("data-autor", "")
-		if author == "" {
-			author = strings.TrimSpace(sel.Find(".post-meta .autor a").Text())
+	// Private-message conversations render each message as
+	//   li > .wrap > .pm-info (.autor, .rd) + .post-contents.post-msg
+	// Iterate the message bodies and read author/date from the surrounding meta.
+	doc.Find(".post-contents").Each(func(i int, sel *goquery.Selection) {
+		body := strings.TrimSpace(sel.Text())
+		if body == "" {
+			return
 		}
-		date := strings.TrimSpace(sel.Find(".post-meta .rd").AttrOr("title", ""))
-		if date == "" {
-			date = strings.TrimSpace(sel.Find(".post-meta .rd").Text())
+		// The meta lives in a sibling .pm-info (or .post-meta) within the wrapper.
+		meta := sel.Parent().Find(".pm-info")
+		if meta.Length() == 0 {
+			meta = sel.Closest(".wrap").Find(".pm-info")
 		}
-		body := strings.TrimSpace(sel.Find(".post-contents").Text())
-
-		if body != "" {
-			msgs = append(msgs, PrivateMessage{
-				Author: author,
-				Date:   date,
-				Body:   body,
-			})
+		if meta.Length() == 0 {
+			meta = sel.Parent().Find(".post-meta")
 		}
+		author := strings.TrimSpace(meta.Find(".autor").First().Text())
+		rd := meta.Find(".rd").First()
+		date := rd.AttrOr("title", strings.TrimSpace(rd.Text()))
+		msgs = append(msgs, PrivateMessage{Author: author, Date: date, Body: body})
 	})
+
+	// Fallback to the classic forum-post structure if nothing matched.
+	if len(msgs) == 0 {
+		doc.Find("div.post, div.cf.post").Each(func(i int, sel *goquery.Selection) {
+			author := sel.AttrOr("data-autor", "")
+			if author == "" {
+				author = strings.TrimSpace(sel.Find(".post-meta .autor a").Text())
+			}
+			date := strings.TrimSpace(sel.Find(".post-meta .rd").AttrOr("title", ""))
+			body := strings.TrimSpace(sel.Find(".post-contents").Text())
+			if body != "" {
+				msgs = append(msgs, PrivateMessage{Author: author, Date: date, Body: body})
+			}
+		})
+	}
 
 	return &Conversation{Title: title, Messages: msgs}, nil
 }

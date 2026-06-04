@@ -124,6 +124,23 @@ func (ss *SessionStore) CreateFromCredentials(clientID, user, pass string) error
 	return nil
 }
 
+// AutoLogin performs a fresh headless login for the given client using the
+// provided credentials, auto-resolving guard verification via MV_TOTP_SECRET.
+// Used at boot so a clean deploy (no session file on disk) self-authenticates.
+func (ss *SessionStore) AutoLogin(clientID, user, pass string) error {
+	scraper := NewForumScraper(user, pass, clientID)
+	if secret := os.Getenv("MV_TOTP_SECRET"); secret != "" {
+		scraper.SetTOTPSecret(secret)
+	}
+	// Relogin clears any stale cookies, logs in fresh and auto-submits the
+	// TOTP guard code when required, then persists the session to disk.
+	if err := scraper.Relogin(); err != nil {
+		return err
+	}
+	ss.Set(clientID, &Session{Scraper: scraper, Status: "authenticated"})
+	return nil
+}
+
 // ForEach calls fn for each stored session while holding a read lock.
 func (ss *SessionStore) ForEach(fn func(clientID string, s *Session)) {
 	ss.mu.RLock()

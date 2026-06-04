@@ -1,0 +1,20 @@
+# Mediavida mobile backend — reverse-engineered MV REST API for the Flutter app.
+app = "mediavida-api"
+primary_region = "cdg"
+
+[build]
+
+[env]
+  BASE_URL = "https://mediavida-api.fly.dev"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Always-on: the server maintains the MV session and polls bubbles for push.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

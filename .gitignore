@@ -5,6 +5,11 @@ mediavida-mcp
 mediavida
 mediavida-linux-amd64
 mediavida-mcp
+mediavida-server
+
+# Flutter build artifacts (mobile/)
+mobile/build/
+mobile/.dart_tool/
 
 # OAuth/session persistence (contains tokens/cookies)
 oauth.json

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -114,7 +115,17 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		err := sessions.CreateFromCredentials(clientID, req.User, req.Pass)
 		if err != nil {
 			if guardErr, ok := err.(*ErrGuardRequired); ok {
-				if req.TOTP == "" {
+				totp := req.TOTP
+				// Auto-generate the code from MV_TOTP_SECRET when the caller
+				// didn't supply one, so headless clients never see guard_required.
+				if totp == "" {
+					if secret := os.Getenv("MV_TOTP_SECRET"); secret != "" {
+						if code, gerr := generateTOTP(secret); gerr == nil {
+							totp = code
+						}
+					}
+				}
+				if totp == "" {
 					writeJSON(w, http.StatusOK, loginResponse{
 						Status:  "guard_required",
 						Message: "guard verification required — call POST /auth/login again with totp set to the 6-digit code from your email or authenticator",
@@ -122,7 +133,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 					return
 				}
 				sess := sessions.Get(clientID)
-				if err := sess.Scraper.SubmitGuard(guardErr.GuardURL, req.TOTP); err != nil {
+				if err := sess.Scraper.SubmitGuard(guardErr.GuardURL, totp); err != nil {
 					writeError(w, http.StatusUnauthorized, "guard verification failed: "+err.Error())
 					return
 				}
@@ -173,6 +184,54 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, webAuthResponse{
 			URL: fmt.Sprintf("%s/auth/login?flow=%s", baseURL, flowID),
 		})
+	})
+
+	// --- forum browse ---
+	mux.HandleFunc("GET /forums", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		var cats []ForumCategory
+		err := withRelogin(scraper, func() error {
+			var e error
+			cats, e = scraper.FetchForumIndex()
+			return e
+		})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"categories": cats})
+	})
+
+	mux.HandleFunc("GET /forums/{slug}/threads", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		slug := r.PathValue("slug")
+		if slug == "" {
+			writeError(w, http.StatusBadRequest, "slug required")
+			return
+		}
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			if n, err := strconv.Atoi(p); err == nil && n > 0 {
+				page = n
+			}
+		}
+		var list *ForumThreadList
+		err := withRelogin(scraper, func() error {
+			var e error
+			list, e = scraper.FetchForumThreads(slug, page)
+			return e
+		})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, list)
 	})
 
 	// --- threads ---
@@ -600,10 +659,14 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 // --- DTOs ---
 
 type messageDTO struct {
-	Num    int    `json:"num"`
-	Author string `json:"author"`
-	Body   string `json:"body"`
-	Liked  bool   `json:"liked"`
+	Num      int    `json:"num"`
+	Author   string `json:"author"`
+	Body     string `json:"body"`
+	BodyHTML string `json:"body_html,omitempty"`
+	Avatar   string `json:"avatar,omitempty"`
+	Date     string `json:"date,omitempty"`
+	Time     int64  `json:"time,omitempty"`
+	Liked    bool   `json:"liked"`
 }
 
 type threadPageDTOType struct {
@@ -620,7 +683,8 @@ func threadPageDTO(p *ThreadPage) threadPageDTOType {
 	}
 	for _, m := range p.Messages {
 		out.Messages = append(out.Messages, messageDTO{
-			Num: m.Num, Author: m.Author, Body: m.Body, Liked: m.Liked,
+			Num: m.Num, Author: m.Author, Body: m.Body, BodyHTML: m.BodyHTML,
+			Avatar: m.Avatar, Date: m.Date, Time: m.Time, Liked: m.Liked,
 		})
 	}
 	return out

@@ -63,10 +63,24 @@ func main() {
 	modForums := NewModForumsStore()
 	hub := NewEventHub()
 
-	// Restore MV sessions from disk for all known API tokens
+	// Restore MV sessions from disk for all known API tokens. If no session is
+	// on disk (e.g. a fresh deploy), fall back to a headless auto-login using
+	// MV_USERNAME/MV_PASSWORD (+ MV_TOTP_SECRET for guard) so the server is
+	// authenticated without any manual step.
+	envUser, envPass := os.Getenv("MV_USERNAME"), os.Getenv("MV_PASSWORD")
 	for token := range apiTokens {
+		short := token[:min(16, len(token))]
 		if sessions.RestoreFromDisk(token) {
-			log.Printf("MV session restored for client %s...", token[:min(16, len(token))])
+			log.Printf("MV session restored for client %s...", short)
+			continue
+		}
+		if envUser != "" && envPass != "" {
+			log.Printf("No session on disk for client %s..., attempting headless auto-login", short)
+			if err := sessions.AutoLogin(token, envUser, envPass); err != nil {
+				log.Printf("Auto-login failed for client %s...: %v", short, err)
+			} else {
+				log.Printf("Auto-login successful for client %s...", short)
+			}
 		}
 	}
 
@@ -103,10 +117,21 @@ func main() {
 	apiMux := http.NewServeMux()
 	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, baseURL)
 
+	apiHandler := APITokenMiddleware(apiTokens, apiMux)
+
 	root := http.NewServeMux()
-	root.Handle("/auth/login", publicMux)
+	// /auth/login serves both the browser flow (GET ?flow / POST form) and the
+	// headless JSON direct-login (POST application/json). Dispatch by method +
+	// content-type so the JSON handler isn't shadowed by the browser flow.
+	root.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			apiHandler.ServeHTTP(w, r)
+			return
+		}
+		publicMux.ServeHTTP(w, r)
+	})
 	root.Handle("/auth/guard", publicMux)
-	root.Handle("/", APITokenMiddleware(apiTokens, apiMux))
+	root.Handle("/", apiHandler)
 
 	log.Printf("Mediavida API listening on %s", *addr)
 	log.Printf("  Base URL:  %s", baseURL)

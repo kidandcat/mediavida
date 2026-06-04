@@ -29,10 +29,14 @@ import (
 
 // ForumMessage represents a single post from the forum thread.
 type ForumMessage struct {
-	Author string
-	Body   string
-	Num    int
-	Liked  bool // true if the current user has liked this post
+	Author   string
+	Body     string // plain text (backward compatible)
+	BodyHTML string // rich inner HTML of .post-contents, URLs absolutized
+	Avatar   string // absolute avatar URL
+	Date      string // human date, e.g. "2/1/25 a las 16:37"
+	Time     int64  // unix seconds, 0 if unknown
+	Num      int
+	Liked    bool // true if the current user has liked this post
 }
 
 // ErrGuardRequired is returned when login requires email PIN verification.
@@ -1542,11 +1546,43 @@ func (s *ForumScraper) parseMessages(doc *goquery.Document) []ForumMessage {
 		author, _ := sel.Attr("data-autor")
 		snum, _ := sel.Attr("data-num")
 		num, _ := strconv.Atoi(snum)
-		body := sel.Find(".post-contents").Text()
-		body = strings.TrimSpace(body)
+
+		contents := sel.Find(".post-contents").First()
+		body := strings.TrimSpace(contents.Text())
+
+		// De-lazyload images and absolutize all URLs so the HTML renders standalone.
+		contents.Find("img[data-src]").Each(func(_ int, img *goquery.Selection) {
+			if ds := img.AttrOr("data-src", ""); ds != "" {
+				img.SetAttr("src", ds)
+			}
+		})
+		contents.Find("img[src]").Each(func(_ int, img *goquery.Selection) {
+			img.SetAttr("src", absolutizeMV(img.AttrOr("src", "")))
+		})
+		contents.Find("a[href]").Each(func(_ int, a *goquery.Selection) {
+			a.SetAttr("href", absolutizeMV(a.AttrOr("href", "")))
+		})
+		bodyHTML, _ := contents.Html()
+		bodyHTML = strings.TrimSpace(bodyHTML)
+
+		avatar := sel.Find(".post-avatar img").First()
+		avatarURL := absolutizeMV(avatar.AttrOr("data-src", avatar.AttrOr("src", "")))
+
+		rd := sel.Find(".post-meta .rd").First()
+		date := rd.AttrOr("title", strings.TrimSpace(rd.Text()))
+		var ts int64
+		if dt := rd.AttrOr("data-time", ""); dt != "" {
+			if n, err := strconv.ParseInt(dt, 10, 64); err == nil {
+				ts = n
+			}
+		}
+
 		liked := sel.Find("a.post-btn.masmola").AttrOr("data-undo", "false") == "true"
-		if body != "" {
-			messages = append(messages, ForumMessage{Author: author, Body: body, Num: num, Liked: liked})
+		if body != "" || bodyHTML != "" {
+			messages = append(messages, ForumMessage{
+				Author: author, Body: body, BodyHTML: bodyHTML,
+				Avatar: avatarURL, Date: date, Time: ts, Num: num, Liked: liked,
+			})
 		}
 	})
 	return messages

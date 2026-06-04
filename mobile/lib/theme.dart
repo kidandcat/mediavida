@@ -168,8 +168,17 @@ class MvTheme {
       navigationBarTheme: NavigationBarThemeData(
         backgroundColor: surface,
         indicatorColor: ext.accent.withValues(alpha: 0.18),
-        labelTextStyle: WidgetStateProperty.all(
-          const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+        iconTheme: WidgetStateProperty.resolveWith(
+          (states) => IconThemeData(
+            color: states.contains(WidgetState.selected) ? ext.accent : ext.textSecondary,
+          ),
+        ),
+        labelTextStyle: WidgetStateProperty.resolveWith(
+          (states) => TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            color: states.contains(WidgetState.selected) ? ext.accent : ext.textSecondary,
+          ),
         ),
       ),
       snackBarTheme: SnackBarThemeData(

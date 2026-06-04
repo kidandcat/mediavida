@@ -108,6 +108,24 @@ class MvApi {
     if (r.statusCode != 200) _fail(r);
   }
 
+  /// Raw editable source of a post in the last-read thread. Read the thread first.
+  Future<String> postSource(int postNum) async {
+    final d = _obj(await _dio.get('/threads/source', queryParameters: {'num': postNum}));
+    return d['source']?.toString() ?? '';
+  }
+
+  /// Fetch the text of a referenced post (#NNNN) in the last-read thread.
+  Future<String> quotedPost(int postNum) async {
+    final d = _obj(await _dio.get('/threads/quote', queryParameters: {'num': postNum}));
+    return d['body_html']?.toString() ?? '';
+  }
+
+  /// Edit one of the user's own posts in the last-read thread.
+  Future<void> editPost(int postNum, String text) async {
+    final r = await _dio.post('/threads/edit', data: {'post_num': postNum, 'text': text});
+    if (r.statusCode != 200) _fail(r);
+  }
+
   Future<TagsResponse> threadTags(String subforum) async {
     final d = _obj(await _dio.get('/threads/tags',
         queryParameters: {'subforum': subforum}));

@@ -32,15 +32,78 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
   final _composer = TextEditingController();
   final _composerFocus = FocusNode();
   final _scroll = ScrollController();
+  String? _me;
+
+  // Per-post keys (to scroll to a referenced #NNNN) and the briefly-highlighted post.
+  final Map<int, GlobalKey> _postKeys = {};
+  int? _highlightNum;
 
   bool _isLiked(Post post) => _likeOverride[post.num] ?? post.liked;
+
+  Future<void> _openPostRef(int num) async {
+    final key = _postKeys[num];
+    if (key?.currentContext != null) {
+      await Scrollable.ensureVisible(key!.currentContext!,
+          duration: const Duration(milliseconds: 350), alignment: 0.15);
+      if (!mounted) return;
+      setState(() => _highlightNum = num);
+      Future.delayed(const Duration(milliseconds: 1600), () {
+        if (mounted) setState(() => _highlightNum = null);
+      });
+      return;
+    }
+    // Referenced post is on another page: fetch its text and show it.
+    final api = ref.read(apiProvider);
+    if (api == null) return;
+    String text;
+    try {
+      text = await api.quotedPost(num);
+    } catch (e) {
+      _snack(e is MvApiException ? e.message : '$e');
+      return;
+    }
+    if (!mounted || text.trim().isEmpty) return;
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: context.scheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.5,
+        maxChildSize: 0.85,
+        builder: (c, scrollCtrl) => ListView(
+          controller: scrollCtrl,
+          padding: const EdgeInsets.all(16),
+          children: [
+            Text('Mensaje #$num',
+                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+            const SizedBox(height: 10),
+            SelectableText(text, style: const TextStyle(fontSize: 15, height: 1.4)),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _loadUser();
     // Open on the most recent page, positioned at the newest post (bottom).
     _load(widget.initialPage, scrollToBottom: true);
+  }
+
+  Future<void> _loadUser() async {
+    final api = ref.read(apiProvider);
+    if (api == null) return;
+    try {
+      final u = await api.currentUser();
+      if (mounted) setState(() => _me = u);
+    } catch (_) {}
   }
 
   @override
@@ -119,6 +182,75 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
   void _quote(Post post) {
     setState(() => _replyToNum = post.num);
     _composerFocus.requestFocus();
+  }
+
+  bool _isMine(Post post) =>
+      _me != null && post.author.toLowerCase() == _me!.toLowerCase();
+
+  Future<void> _startEdit(Post post) async {
+    final api = ref.read(apiProvider);
+    if (api == null) return;
+    // Ensure the backend's last-read thread is this page, then fetch the source.
+    String source;
+    try {
+      source = await api.postSource(post.num);
+    } catch (e) {
+      _snack(e is MvApiException ? e.message : '$e');
+      return;
+    }
+    if (!mounted) return;
+    final controller = TextEditingController(text: source);
+    final saved = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: context.scheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.only(
+          left: 14,
+          right: 14,
+          top: 14,
+          bottom: MediaQuery.of(ctx).viewInsets.bottom + 14,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Editar mensaje #${post.num}',
+                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              minLines: 4,
+              maxLines: 12,
+              decoration: const InputDecoration(hintText: 'Contenido del mensaje'),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+                const SizedBox(width: 8),
+                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Guardar')),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+    if (saved != true) return;
+    final text = controller.text.trim();
+    if (text.isEmpty) return;
+    try {
+      await api.editPost(post.num, text);
+      _snack('Mensaje editado');
+      await _load(_page?.currentPage ?? widget.initialPage);
+    } catch (e) {
+      _snack(e is MvApiException ? e.message : '$e');
+    }
   }
 
   Future<void> _submitReply() async {
@@ -243,13 +375,21 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
         controller: _scroll,
         padding: const EdgeInsets.only(top: 6, bottom: 16),
         itemCount: page.messages.length,
-        itemBuilder: (c, i) => _PostCard(
-          post: page.messages[i],
-          liked: _isLiked(page.messages[i]),
-          onAuthorTap: () => context.openUser(page.messages[i].author),
-          onLike: () => _toggleLike(page.messages[i]),
-          onQuote: () => _quote(page.messages[i]),
-        ),
+        itemBuilder: (c, i) {
+          final post = page.messages[i];
+          return _PostCard(
+            key: _postKeys.putIfAbsent(post.num, () => GlobalKey()),
+            post: post,
+            liked: _isLiked(post),
+            mine: _isMine(post),
+            highlighted: _highlightNum == post.num,
+            onAuthorTap: () => context.openUser(post.author),
+            onLike: () => _toggleLike(post),
+            onQuote: () => _quote(post),
+            onEdit: () => _startEdit(post),
+            onPostRef: _openPostRef,
+          );
+        },
       ),
     );
   }
@@ -368,15 +508,24 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
 class _PostCard extends StatelessWidget {
   final Post post;
   final bool liked;
+  final bool mine;
+  final bool highlighted;
   final VoidCallback onAuthorTap;
   final VoidCallback onLike;
   final VoidCallback onQuote;
+  final VoidCallback onEdit;
+  final void Function(int postNum) onPostRef;
   const _PostCard({
+    super.key,
     required this.post,
     required this.liked,
+    required this.mine,
+    required this.highlighted,
     required this.onAuthorTap,
     required this.onLike,
     required this.onQuote,
+    required this.onEdit,
+    required this.onPostRef,
   });
 
   @override
@@ -384,6 +533,7 @@ class _PostCard extends StatelessWidget {
     final rel = relativeTime(post.time);
     final when = rel.isNotEmpty ? rel : post.date;
     return Card(
+      color: highlighted ? context.scheme.primary.withValues(alpha: 0.16) : null,
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
@@ -417,7 +567,7 @@ class _PostCard extends StatelessWidget {
             ),
             const SizedBox(height: 10),
             post.bodyHtml.trim().isNotEmpty
-                ? PostHtml(post.bodyHtml)
+                ? PostHtml(post.bodyHtml, onPostRef: onPostRef)
                 : Text(post.body, style: const TextStyle(fontSize: 15, height: 1.45)),
             const SizedBox(height: 6),
             Row(
@@ -438,6 +588,15 @@ class _PostCard extends StatelessWidget {
                   ),
                 ),
                 const Spacer(),
+                if (mine)
+                  TextButton.icon(
+                    onPressed: onEdit,
+                    icon: Icon(Icons.edit_outlined, size: 18, color: context.mv.textSecondary),
+                    label: Text(
+                      'Editar',
+                      style: TextStyle(fontSize: 13, color: context.mv.textSecondary),
+                    ),
+                  ),
                 TextButton.icon(
                   onPressed: onQuote,
                   icon: Icon(Icons.reply, size: 18, color: context.mv.textSecondary),

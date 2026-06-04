@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -17,8 +19,9 @@ class HomeScreen extends ConsumerStatefulWidget {
   ConsumerState<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends ConsumerState<HomeScreen> {
+class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObserver {
   int _index = 0;
+  Timer? _timer;
 
   static const _tabs = [
     ForumIndexScreen(),
@@ -29,17 +32,46 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   ];
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Poll the notification counters so badges clear after reading.
+    _timer = Timer.periodic(const Duration(seconds: 25), (_) => _refreshBubbles());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refreshBubbles();
+  }
+
+  void _refreshBubbles() {
+    if (mounted) ref.invalidate(bubblesProvider);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    // Prefer the live SSE stream; fall back to the polled value.
-    final live = ref.watch(bubblesStreamProvider).value;
-    final polled = ref.watch(bubblesProvider).value;
-    final b = live ?? polled ?? const Bubbles();
+    // A live SSE push just triggers a fresh poll (avoids a stale stream value
+    // overriding the counters after they've been cleared server-side).
+    ref.listen(bubblesStreamProvider, (prev, next) {
+      if (next.hasValue) _refreshBubbles();
+    });
+    final b = ref.watch(bubblesProvider).value ?? const Bubbles();
 
     return Scaffold(
       body: IndexedStack(index: _index, children: _tabs),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
+        onDestinationSelected: (i) {
+          setState(() => _index = i);
+          _refreshBubbles();
+        },
         destinations: [
           const NavigationDestination(
               icon: Icon(Icons.forum_outlined), selectedIcon: Icon(Icons.forum), label: 'Foros'),

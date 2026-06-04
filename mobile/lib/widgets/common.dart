@@ -8,7 +8,9 @@ import '../theme.dart';
 /// Renders a post's rich HTML body (`body_html`) with tappable links/images.
 class PostHtml extends StatelessWidget {
   final String html;
-  const PostHtml(this.html, {super.key});
+  /// Called when the user taps a #NNNN post reference inside the body.
+  final void Function(int postNum)? onPostRef;
+  const PostHtml(this.html, {super.key, this.onPostRef});
 
   @override
   Widget build(BuildContext context) {
@@ -20,6 +22,12 @@ class PostHtml extends StatelessWidget {
       html,
       textStyle: TextStyle(fontSize: 15, height: 1.45, color: context.scheme.onSurface),
       onTapUrl: (url) async {
+        // Intercept references to other posts (#NNNN) and open them in-app.
+        final ref = RegExp(r'#(\d+)$').firstMatch(url);
+        if (ref != null && onPostRef != null) {
+          onPostRef!(int.parse(ref.group(1)!));
+          return true;
+        }
         final uri = Uri.tryParse(url);
         if (uri == null) return false;
         if (await canLaunchUrl(uri)) {

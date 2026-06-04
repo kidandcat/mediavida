@@ -444,6 +444,36 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, conversationDTO(conv))
 	})
 
+	mux.HandleFunc("POST /messages/{id}/reply", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		id := r.PathValue("id")
+		if id == "" {
+			writeError(w, http.StatusBadRequest, "id is required")
+			return
+		}
+		var req struct {
+			Text string `json:"text"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(req.Text) == "" {
+			writeError(w, http.StatusBadRequest, "text is required")
+			return
+		}
+		err := withRelogin(scraper, func() error { return scraper.SendPrivateMessage(id, req.Text) })
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		scraper.AutoSave()
+		writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+	})
+
 	// --- favorites / user content ---
 	mux.HandleFunc("GET /favorites", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)

@@ -1352,6 +1352,68 @@ func (s *ForumScraper) FetchConversation(id string) (*Conversation, error) {
 	return &Conversation{Title: title, Messages: msgs}, nil
 }
 
+// SendPrivateMessage posts a reply into an existing private-message conversation.
+// It re-reads the conversation page to obtain a fresh CSRF token + thread id,
+// then submits the message form (POST /msg/pm_action.php).
+func (s *ForumScraper) SendPrivateMessage(conversationID, text string) error {
+	if !s.loggedIn {
+		return fmt.Errorf("not logged in")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("empty message")
+	}
+
+	convURL := fmt.Sprintf("https://www.mediavida.com/mensajes/%s", conversationID)
+	resp, err := s.doGet(convURL)
+	if err != nil {
+		return fmt.Errorf("load conversation failed: %w", err)
+	}
+	defer resp.Body.Close()
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	token := doc.Find("#pm-form #token, #pm-form input[name=token]").AttrOr("value", "")
+	if token == "" {
+		token = doc.Find("#token").AttrOr("value", "")
+	}
+	mtid := doc.Find("#pm-form #mtid, #mtid").AttrOr("value", "")
+	if mtid == "" {
+		mtid = conversationID
+	}
+	if token == "" {
+		return fmt.Errorf("could not find PM CSRF token")
+	}
+
+	form := url.Values{
+		"token": {token},
+		"mtid":  {mtid},
+		"msg":   {text},
+	}
+	req, err := http.NewRequest("POST", "https://www.mediavida.com/msg/pm_action.php", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Origin", "https://www.mediavida.com")
+	req.Header.Set("Referer", convURL)
+	postResp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send message failed: %w", err)
+	}
+	defer postResp.Body.Close()
+	body, _ := io.ReadAll(postResp.Body)
+	if postResp.StatusCode >= 400 {
+		return fmt.Errorf("send message returned %d: %s", postResp.StatusCode, strings.TrimSpace(string(body[:min(200, len(body))])))
+	}
+	return nil
+}
+
 // Username returns the logged-in username.
 func (s *ForumScraper) Username() string {
 	return s.user

@@ -4,7 +4,8 @@ import '../api/models.dart';
 import '../api/mv_api.dart';
 import '../core/config.dart';
 
-/// Holds the current app config (base URL + token). Null until loaded.
+/// Holds the current app config (base URL + device token + login state).
+/// Null until loaded.
 class ConfigNotifier extends Notifier<AppConfig?> {
   @override
   AppConfig? build() {
@@ -16,24 +17,33 @@ class ConfigNotifier extends Notifier<AppConfig?> {
     state = await AppConfig.load();
   }
 
-  Future<void> setConfig({required String baseUrl, required String token}) async {
-    state = await AppConfig.save(baseUrl: baseUrl, token: token);
+  Future<void> setBaseUrl(String url) async {
+    await AppConfig.setBaseUrl(url);
+    state = state?.copyWith(baseUrl: url) ?? await AppConfig.load();
+  }
+
+  Future<void> markLoggedIn() async {
+    await AppConfig.setLoggedIn(true);
+    state = state?.copyWith(loggedIn: true) ?? await AppConfig.load();
   }
 
   Future<void> signOut() async {
-    await AppConfig.clear();
-    state = const AppConfig(baseUrl: '', token: '');
+    try {
+      await ref.read(apiProvider)?.logout();
+    } catch (_) {}
+    await AppConfig.setLoggedIn(false);
+    state = state?.copyWith(loggedIn: false) ?? await AppConfig.load();
   }
 }
 
 final configProvider =
     NotifierProvider<ConfigNotifier, AppConfig?>(ConfigNotifier.new);
 
-/// The API client, rebuilt whenever the config changes. Null until configured.
+/// The API client for the current device token. Null until config is loaded.
 final apiProvider = Provider<MvApi?>((ref) {
   final cfg = ref.watch(configProvider);
-  if (cfg == null || !cfg.isConfigured) return null;
-  return MvApi(baseUrl: cfg.baseUrl, token: cfg.token);
+  if (cfg == null || cfg.deviceToken.isEmpty) return null;
+  return MvApi(baseUrl: cfg.baseUrl, token: cfg.deviceToken);
 });
 
 /// The forum index (categories + subforums).

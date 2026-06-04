@@ -4,7 +4,17 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:http/http.dart' as http;
 
+import '../core/config.dart';
 import 'models.dart';
+
+enum AppLoginStatus { authenticated, guardRequired, failed }
+
+class AppLoginResult {
+  final AppLoginStatus status;
+  final String message;
+  final String? username;
+  AppLoginResult(this.status, {this.message = '', this.username});
+}
 
 /// Thrown when the API rejects the request or the session is unavailable.
 class MvApiException implements Exception {
@@ -55,6 +65,41 @@ class MvApi {
   }
 
   // --- auth / status ---
+
+  /// Per-device login with Mediavida credentials. The backend ties the MV
+  /// session to this device's [token]. If MV requires guard verification the
+  /// result is [AppLoginStatus.guardRequired]; call again passing [totp].
+  Future<AppLoginResult> appLogin(String user, String pass, {String? totp}) async {
+    final r = await _dio.post(
+      '/auth/app-login',
+      data: {
+        'token': _token,
+        'user': user,
+        'pass': pass,
+        if (totp != null && totp.isNotEmpty) 'totp': totp,
+      },
+      options: Options(headers: {'X-App-Key': AppConfig.appKey}),
+    );
+    final d = r.data is Map ? r.data as Map : const {};
+    if (r.statusCode != 200) {
+      return AppLoginResult(AppLoginStatus.failed,
+          message: d['error']?.toString() ?? 'Error de conexión');
+    }
+    switch (d['status']) {
+      case 'authenticated':
+        return AppLoginResult(AppLoginStatus.authenticated, username: d['username']?.toString());
+      case 'guard_required':
+        return AppLoginResult(AppLoginStatus.guardRequired, message: d['message']?.toString() ?? '');
+      default:
+        return AppLoginResult(AppLoginStatus.failed, message: d['error']?.toString() ?? 'Login fallido');
+    }
+  }
+
+  Future<void> logout() async {
+    try {
+      await _dio.post('/auth/logout');
+    } catch (_) {}
+  }
 
   Future<bool> isAuthenticated() async {
     final r = await _dio.get('/auth/status');

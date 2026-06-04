@@ -19,10 +19,9 @@ GoRouter buildRouter(WidgetRef ref) {
     redirect: (context, state) {
       final cfg = ref.read(configProvider);
       if (cfg == null) return null; // still loading
-      final configured = cfg.isConfigured;
-      final atSetup = state.matchedLocation == '/setup';
-      if (!configured && !atSetup) return '/setup';
-      if (configured && atSetup) return '/';
+      final atLogin = state.matchedLocation == '/setup';
+      if (!cfg.loggedIn && !atLogin) return '/setup';
+      if (cfg.loggedIn && atLogin) return '/';
       return null;
     },
     routes: [

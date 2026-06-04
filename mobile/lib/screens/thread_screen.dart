@@ -129,6 +129,16 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     });
   }
 
+  void _animateToBottom() {
+    if (_scroll.hasClients) {
+      _scroll.animateTo(
+        _scroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
   Future<void> _load(int page, {bool scrollToBottom = false}) async {
     final api = ref.read(apiProvider);
     if (api == null) {
@@ -430,6 +440,8 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
                         canNext ? () => _load(page.currentPage + 1) : null),
                     _pagerBtn(Icons.last_page, 'Última',
                         canNext ? () => _load(page.totalPages) : null),
+                    _pagerBtn(Icons.vertical_align_bottom, 'Ir al final de la página',
+                        _animateToBottom),
                   ],
                 ),
               ),

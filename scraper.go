@@ -556,6 +556,56 @@ func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
 	return string(body), nil
 }
 
+// GetQuotedPost fetches a single post of the last-read thread by number,
+// as the web does when expanding a #NNNN reference (post_quote.php).
+// Returns the author and the rendered, URL-absolutized HTML body.
+func (s *ForumScraper) GetQuotedPost(postNum int) (author, bodyHTML string, err error) {
+	if !s.loggedIn {
+		return "", "", fmt.Errorf("not logged in")
+	}
+	if s.threadID == "" || s.csrfToken == "" {
+		return "", "", fmt.Errorf("no thread loaded; read the thread first")
+	}
+	data := url.Values{
+		"num":   {strconv.Itoa(postNum)},
+		"tid":   {s.threadID},
+		"token": {s.csrfToken},
+	}
+	req, e := http.NewRequest("POST", "https://www.mediavida.com/foro/post_quote.php", strings.NewReader(data.Encode()))
+	if e != nil {
+		return "", "", e
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Origin", "https://www.mediavida.com")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	resp, e := s.client.Do(req)
+	if e != nil {
+		return "", "", fmt.Errorf("quote request failed: %w", e)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("quote returned %d", resp.StatusCode)
+	}
+	// post_quote.php returns JSON {status, min, full} with the quote source text.
+	var res struct {
+		Status int    `json:"status"`
+		Min    string `json:"min"`
+		Full   string `json:"full"`
+	}
+	if e := json.Unmarshal(body, &res); e != nil {
+		return "", strings.TrimSpace(string(body)), nil
+	}
+	text := res.Full
+	if text == "" {
+		text = res.Min
+	}
+	return "", text, nil
+}
+
 // EditMessage edits an existing post in the last-read thread (poster.php with a
 // num parameter edits instead of creating a new reply). Fetch the thread first.
 func (s *ForumScraper) EditMessage(postNum int, text string) error {

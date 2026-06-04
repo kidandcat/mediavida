@@ -335,6 +335,25 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, map[string]any{"num": num, "source": src})
 	})
 
+	// Fetch a single post of the last-read thread by number (for #NNNN refs).
+	mux.HandleFunc("GET /threads/quote", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		num, _ := strconv.Atoi(r.URL.Query().Get("num"))
+		if num <= 0 {
+			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
+			return
+		}
+		author, bodyHTML, err := scraper.GetQuotedPost(num)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"num": num, "author": author, "body_html": bodyHTML})
+	})
+
 	// Edit one of the user's own posts in the last-read thread.
 	mux.HandleFunc("POST /threads/edit", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)

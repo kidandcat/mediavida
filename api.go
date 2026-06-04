@@ -316,6 +316,55 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, map[string]string{"status": "posted"})
 	})
 
+	// Raw editable source of a post in the last-read thread (call GET /threads first).
+	mux.HandleFunc("GET /threads/source", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		num, _ := strconv.Atoi(r.URL.Query().Get("num"))
+		if num <= 0 {
+			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
+			return
+		}
+		src, err := scraper.GetPostSource(num)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"num": num, "source": src})
+	})
+
+	// Edit one of the user's own posts in the last-read thread.
+	mux.HandleFunc("POST /threads/edit", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		var req struct {
+			PostNum int    `json:"post_num"`
+			Text    string `json:"text"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		if req.PostNum <= 0 {
+			writeError(w, http.StatusBadRequest, "post_num must be > 0")
+			return
+		}
+		if strings.TrimSpace(req.Text) == "" {
+			writeError(w, http.StatusBadRequest, "text is required")
+			return
+		}
+		if err := scraper.EditMessage(req.PostNum, req.Text); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		scraper.AutoSave()
+		writeJSON(w, http.StatusOK, map[string]any{"status": "edited", "post_num": req.PostNum})
+	})
+
 	mux.HandleFunc("POST /threads", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)
 		if scraper == nil {

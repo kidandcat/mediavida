@@ -520,6 +520,86 @@ func (s *ForumScraper) LikeMessage(postNum int) error {
 	return nil
 }
 
+// GetPostSource returns the raw (editable) source text of a post in the
+// last-read thread. Fetch the thread first so tid/token are set.
+func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
+	if !s.loggedIn {
+		return "", fmt.Errorf("not logged in")
+	}
+	if s.threadID == "" || s.csrfToken == "" {
+		return "", fmt.Errorf("no thread loaded; read the thread first")
+	}
+	data := url.Values{
+		"tid":   {s.threadID},
+		"num":   {strconv.Itoa(postNum)},
+		"token": {s.csrfToken},
+	}
+	req, err := http.NewRequest("POST", "https://www.mediavida.com/foro/post_contents.php", strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Origin", "https://www.mediavida.com")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("post source request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("post source returned %d", resp.StatusCode)
+	}
+	return string(body), nil
+}
+
+// EditMessage edits an existing post in the last-read thread (poster.php with a
+// num parameter edits instead of creating a new reply). Fetch the thread first.
+func (s *ForumScraper) EditMessage(postNum int, text string) error {
+	if !s.loggedIn {
+		return fmt.Errorf("not logged in")
+	}
+	if s.threadID == "" || s.csrfToken == "" {
+		return fmt.Errorf("no thread loaded; read the thread first")
+	}
+	data := url.Values{
+		"cuerpo": {text},
+		"tid":    {s.threadID},
+		"num":    {strconv.Itoa(postNum)},
+		"token":  {s.csrfToken},
+	}
+	req, err := http.NewRequest("POST", "https://www.mediavida.com/foro/action/poster.php", strings.NewReader(data.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Origin", "https://www.mediavida.com")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("edit request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("edit returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body[:min(200, len(body))])))
+	}
+	// Response is JSON {"status":1,"msg":...} on success.
+	var res struct {
+		Status int `json:"status"`
+	}
+	if err := json.Unmarshal(body, &res); err == nil && res.Status != 1 {
+		return fmt.Errorf("edit rejected by mediavida: %s", strings.TrimSpace(string(body[:min(200, len(body))])))
+	}
+	return nil
+}
+
 
 // PostReply posts a reply to the current thread. If replyToNum > 0, prepends #NUM to reference that post.
 func (s *ForumScraper) PostReply(text string, replyToNum int) error {

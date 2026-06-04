@@ -18,9 +18,10 @@ class ConversationScreen extends ConsumerStatefulWidget {
   ConsumerState<ConversationScreen> createState() => _ConversationScreenState();
 }
 
-class _ConversationScreenState extends ConsumerState<ConversationScreen> {
+class _ConversationScreenState extends ConsumerState<ConversationScreen> with WidgetsBindingObserver {
   final _scroll = ScrollController();
   final _composer = TextEditingController();
+  final _composerFocus = FocusNode();
 
   Conversation? _conv;
   Object? _error;
@@ -31,15 +32,24 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadUser();
     _load(scrollToBottom: true);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _scroll.dispose();
     _composer.dispose();
+    _composerFocus.dispose();
     super.dispose();
+  }
+
+  // Keep the latest message visible when the keyboard opens.
+  @override
+  void didChangeMetrics() {
+    if (_composerFocus.hasFocus) _jumpToBottom();
   }
 
   Future<void> _loadUser() async {
@@ -170,6 +180,7 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
             Expanded(
               child: TextField(
                 controller: _composer,
+                focusNode: _composerFocus,
                 minLines: 1,
                 maxLines: 5,
                 textCapitalization: TextCapitalization.sentences,

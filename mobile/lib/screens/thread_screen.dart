@@ -19,7 +19,7 @@ class ThreadScreen extends ConsumerStatefulWidget {
   ConsumerState<ThreadScreen> createState() => _ThreadScreenState();
 }
 
-class _ThreadScreenState extends ConsumerState<ThreadScreen> {
+class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBindingObserver {
   ThreadPage? _page;
   Object? _error;
   bool _loading = true;
@@ -38,16 +38,24 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // Open on the most recent page, positioned at the newest post (bottom).
     _load(widget.initialPage, scrollToBottom: true);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _composer.dispose();
     _composerFocus.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  // When the keyboard opens (composer focused), keep the newest post in view.
+  @override
+  void didChangeMetrics() {
+    if (_composerFocus.hasFocus) _jumpToBottom();
   }
 
   void _jumpToBottom() {

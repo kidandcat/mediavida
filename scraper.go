@@ -1313,14 +1313,15 @@ func (s *ForumScraper) FetchConversation(id string) (*Conversation, error) {
 
 	var msgs []PrivateMessage
 	// Private-message conversations render each message as
-	//   li > .wrap > .pm-info (.autor, .rd) + .post-contents.post-msg
-	// Iterate the message bodies and read author/date from the surrounding meta.
+	//   li.pm > .wrap > .pm-info (.autor, .rd) + .post-contents.post-msg
+	// Consecutive messages from the same author render as li.pm.nested WITHOUT
+	// their own .pm-info, so carry the last known author forward.
+	lastAuthor := ""
 	doc.Find(".post-contents").Each(func(i int, sel *goquery.Selection) {
 		body := strings.TrimSpace(sel.Text())
 		if body == "" {
 			return
 		}
-		// The meta lives in a sibling .pm-info (or .post-meta) within the wrapper.
 		meta := sel.Parent().Find(".pm-info")
 		if meta.Length() == 0 {
 			meta = sel.Closest(".wrap").Find(".pm-info")
@@ -1329,6 +1330,11 @@ func (s *ForumScraper) FetchConversation(id string) (*Conversation, error) {
 			meta = sel.Parent().Find(".post-meta")
 		}
 		author := strings.TrimSpace(meta.Find(".autor").First().Text())
+		if author == "" {
+			author = lastAuthor
+		} else {
+			lastAuthor = author
+		}
 		rd := meta.Find(".rd").First()
 		date := rd.AttrOr("title", strings.TrimSpace(rd.Text()))
 		msgs = append(msgs, PrivateMessage{Author: author, Date: date, Body: body})

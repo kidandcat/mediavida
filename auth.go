@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"html/template"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -133,7 +135,7 @@ button:hover{background:#1a4a8a}
 
 // APITokenMiddleware validates the Bearer token against the allowed API tokens.
 // Sets the client ID (the token itself) in the request context.
-func APITokenMiddleware(validTokens map[string]bool, next http.Handler) http.Handler {
+func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -142,13 +144,73 @@ func APITokenMiddleware(validTokens map[string]bool, next http.Handler) http.Han
 		}
 
 		token := strings.TrimPrefix(auth, "Bearer ")
-		if !validTokens[token] {
+		// Valid if it's a configured API token (legacy/tooling) or it has a live
+		// session created via /auth/app-login (per-device app login).
+		if !validTokens[token] && (sessions == nil || sessions.Get(token) == nil) {
 			http.Error(w, "unauthorized: invalid API token", http.StatusUnauthorized)
 			return
 		}
 
 		ctx := context.WithValue(r.Context(), clientIDKey, token)
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// RegisterAppLoginHandler wires POST /auth/app-login: a per-device login where
+// the app supplies its own bearer token plus the user's Mediavida credentials.
+// Gated by the APP_KEY env var (anti-abuse) when set. No bearer needed.
+func RegisterAppLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
+	appKey := os.Getenv("APP_KEY")
+	mux.HandleFunc("POST /auth/app-login", func(w http.ResponseWriter, r *http.Request) {
+		if appKey != "" && r.Header.Get("X-App-Key") != appKey {
+			writeError(w, http.StatusUnauthorized, "invalid app key")
+			return
+		}
+		var req struct {
+			Token string `json:"token"`
+			User  string `json:"user"`
+			Pass  string `json:"pass"`
+			TOTP  string `json:"totp,omitempty"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		req.Token = strings.TrimSpace(req.Token)
+		if req.Token == "" || req.User == "" || req.Pass == "" {
+			writeError(w, http.StatusBadRequest, "token, user and pass are required")
+			return
+		}
+
+		err := sessions.CreateFromCredentials(req.Token, req.User, req.Pass)
+		if err != nil {
+			var guardErr *ErrGuardRequired
+			if errors.As(err, &guardErr) {
+				if req.TOTP == "" {
+					writeJSON(w, http.StatusOK, loginResponse{
+						Status:  "guard_required",
+						Message: "verificación requerida — reenvía con el código (PIN del email o app de autenticación)",
+					})
+					return
+				}
+				sess := sessions.Get(req.Token)
+				if sess == nil || sess.Scraper == nil {
+					writeError(w, http.StatusUnauthorized, "sesión de verificación no encontrada; reintenta")
+					return
+				}
+				if err := sess.Scraper.SubmitGuard(guardErr.GuardURL, req.TOTP); err != nil {
+					writeError(w, http.StatusUnauthorized, "código incorrecto: "+err.Error())
+					return
+				}
+				sess.Status = "authenticated"
+				sess.Scraper.SaveSession()
+				writeJSON(w, http.StatusOK, loginResponse{Status: "authenticated", Username: req.User})
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "login fallido: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, loginResponse{Status: "authenticated", Username: req.User})
 	})
 }
 

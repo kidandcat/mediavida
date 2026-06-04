@@ -108,18 +108,19 @@ func main() {
 	keepAlive := NewSessionKeepAlive(sessions)
 	keepAlive.Start()
 
-	// Public HTML auth flow (no API token required) — separate mux so it isn't
-	// behind the Bearer middleware.
+	// Public auth flow (no Bearer required): browser flow + per-device app login.
 	publicMux := http.NewServeMux()
 	RegisterLoginHandler(publicMux, sessions)
+	RegisterAppLoginHandler(publicMux, sessions)
 
 	// REST API mux — everything here requires Authorization: Bearer <token>.
 	apiMux := http.NewServeMux()
 	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, baseURL)
 
-	apiHandler := APITokenMiddleware(apiTokens, apiMux)
+	apiHandler := APITokenMiddleware(apiTokens, sessions, apiMux)
 
 	root := http.NewServeMux()
+	root.Handle("/auth/app-login", publicMux)
 	// /auth/login serves both the browser flow (GET ?flow / POST form) and the
 	// headless JSON direct-login (POST application/json). Dispatch by method +
 	// content-type so the JSON handler isn't shadowed by the browser flow.

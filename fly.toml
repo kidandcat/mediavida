@@ -18,3 +18,9 @@ primary_region = "cdg"
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
+
+# Persist per-device login sessions (~/.config/mediavida-mcp, HOME=/app) so they
+# survive restarts and redeploys.
+[mounts]
+  source = "mvdata"
+  destination = "/app/.config"

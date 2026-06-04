@@ -129,13 +129,25 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     });
   }
 
-  void _animateToBottom() {
-    if (_scroll.hasClients) {
-      _scroll.animateTo(
+  /// Scrolls to the true bottom. With ListView.builder the max scroll extent is
+  /// only an estimate until the last items are laid out (and grows as images
+  /// load), so we re-settle to the latest extent over several frames.
+  Future<void> _goBottom({bool animate = false}) async {
+    if (!_scroll.hasClients) {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted || !_scroll.hasClients) return;
+    }
+    if (animate) {
+      await _scroll.animateTo(
         _scroll.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 300),
+        duration: const Duration(milliseconds: 280),
         curve: Curves.easeOut,
       );
+    }
+    for (final ms in const [0, 60, 180, 400]) {
+      await Future<void>.delayed(Duration(milliseconds: ms));
+      if (!mounted || !_scroll.hasClients) return;
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
     }
   }
 
@@ -159,7 +171,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
         _page = result;
         _loading = false;
       });
-      if (scrollToBottom) _jumpToBottom();
+      if (scrollToBottom) _goBottom();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -441,7 +453,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
                     _pagerBtn(Icons.last_page, 'Última',
                         canNext ? () => _load(page.totalPages) : null),
                     _pagerBtn(Icons.vertical_align_bottom, 'Ir al final de la página',
-                        _animateToBottom),
+                        () => _goBottom(animate: true)),
                   ],
                 ),
               ),

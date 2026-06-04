@@ -27,6 +27,22 @@ class ConfigNotifier extends Notifier<AppConfig?> {
     state = state?.copyWith(loggedIn: true) ?? await AppConfig.load();
   }
 
+  /// If we think we're logged in but the backend has no active session
+  /// (e.g. it was redeployed or the MV session expired), drop to the login
+  /// screen instead of showing errors everywhere.
+  Future<void> verifySession() async {
+    final cfg = state;
+    if (cfg == null || !cfg.loggedIn) return;
+    final api = ref.read(apiProvider);
+    if (api == null) return;
+    try {
+      if (!await api.isAuthenticated()) {
+        await AppConfig.setLoggedIn(false);
+        state = cfg.copyWith(loggedIn: false);
+      }
+    } catch (_) {}
+  }
+
   Future<void> signOut() async {
     try {
       await ref.read(apiProvider)?.logout();

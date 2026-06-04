@@ -35,6 +35,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Drop to login if the backend session is gone (redeploy / expiry).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(configProvider.notifier).verifySession();
+    });
     // Poll the notification counters so badges clear after reading.
     _timer = Timer.periodic(const Duration(seconds: 25), (_) => _refreshBubbles());
   }
@@ -48,7 +52,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _refreshBubbles();
+    if (state == AppLifecycleState.resumed) {
+      _refreshBubbles();
+      ref.read(configProvider.notifier).verifySession();
+    }
   }
 
   void _refreshBubbles() {

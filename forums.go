@@ -59,6 +59,63 @@ type ForumThreadList struct {
 	Threads     []ForumThread `json:"threads"`
 }
 
+// PortadaItem is a featured thread card from the homepage feed.
+type PortadaItem struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Forum   string `json:"forum"`
+	Intro   string `json:"intro"`
+	Image   string `json:"image"`
+	Replies string `json:"replies,omitempty"`
+}
+
+// FetchPortada returns the homepage (portada) feed of featured threads.
+func (s *ForumScraper) FetchPortada() ([]PortadaItem, error) {
+	if !s.loggedIn {
+		return nil, fmt.Errorf("not logged in")
+	}
+	resp, err := s.doGet("https://www.mediavida.com/")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var items []PortadaItem
+	seen := map[string]bool{}
+	doc.Find(".news-item").Each(func(_ int, sel *goquery.Selection) {
+		info := sel.Find(".news-info").First()
+		a := info.Find("h4 a").First()
+		title := strings.TrimSpace(a.Text())
+		href := a.AttrOr("href", "")
+		if href == "" {
+			href = sel.Find("a.news-media").AttrOr("href", "")
+		}
+		if href != "" && !strings.HasPrefix(href, "http") {
+			href = "https://www.mediavida.com" + href
+		}
+		if title == "" || href == "" || seen[href] {
+			return
+		}
+		seen[href] = true
+		media := sel.Find("a.news-media").First()
+		img := absolutizeMV(media.Find("img").AttrOr("data-src", media.Find("img").AttrOr("src", "")))
+		replies := strings.TrimSpace(media.Find("div").First().Text())
+		items = append(items, PortadaItem{
+			Title:   title,
+			URL:     href,
+			Forum:   strings.TrimSpace(info.Find(".news-cat").Text()),
+			Intro:   strings.TrimSpace(info.Find(".news-intro").Text()),
+			Image:   img,
+			Replies: replies,
+		})
+	})
+	return items, nil
+}
+
 // FetchForumIndex returns the forum index grouped by category.
 func (s *ForumScraper) FetchForumIndex() ([]ForumCategory, error) {
 	if !s.loggedIn {

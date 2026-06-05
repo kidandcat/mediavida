@@ -187,6 +187,24 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 	})
 
 	// --- forum browse ---
+	mux.HandleFunc("GET /portada", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		var items []PortadaItem
+		err := withRelogin(scraper, func() error {
+			var e error
+			items, e = scraper.FetchPortada()
+			return e
+		})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	})
+
 	mux.HandleFunc("GET /forums", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)
 		if scraper == nil {

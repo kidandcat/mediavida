@@ -55,69 +55,55 @@ class ForumIndexScreen extends ConsumerWidget {
     );
   }
 
-  void _showSubforums(BuildContext context, WidgetRef ref) {
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: context.scheme.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) => DraggableScrollableSheet(
-        expand: false,
-        initialChildSize: 0.7,
-        maxChildSize: 0.92,
-        builder: (c, scrollCtrl) => Consumer(
-          builder: (context, ref, _) {
-            final categories = ref.watch(forumsProvider);
-            return categories.when(
-            loading: () => const LoadingView(),
-            error: (e, _) => ErrorView(e, onRetry: () => ref.invalidate(forumsProvider)),
-            data: (data) => ListView(
-              controller: scrollCtrl,
-              padding: const EdgeInsets.only(bottom: 16),
-              children: [
-                const Padding(
-                  padding: EdgeInsets.fromLTRB(18, 14, 18, 6),
-                  child: Text('Subforos',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                ),
-                for (final category in data) ...[
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(18, 12, 18, 4),
-                    child: Text(
-                      category.name.toUpperCase(),
-                      style: TextStyle(
-                        color: context.scheme.primary,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 0.6,
-                      ),
-                    ),
-                  ),
-                  for (final forum in category.forums)
-                    ListTile(
-                      dense: true,
-                      title: Text(forum.name, style: const TextStyle(fontWeight: FontWeight.w600)),
-                      subtitle: forum.description.trim().isEmpty
-                          ? null
-                          : Text(forum.description,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(color: context.mv.textFaint, fontSize: 12)),
-                      onTap: () {
-                        Navigator.pop(ctx);
-                        context.openForum(forum.slug, name: forum.name);
-                      },
-                    ),
-                ],
-              ],
-            ),
-            );
-          },
+  Future<void> _showSubforums(BuildContext context, WidgetRef ref) async {
+    // Load the forum index, then drop a menu down from the app bar (like the web).
+    List<ForumCategory> cats;
+    try {
+      cats = await ref.read(forumsProvider.future);
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
+      return;
+    }
+    if (!context.mounted) return;
+
+    final items = <PopupMenuEntry<ForumInfo>>[];
+    for (final cat in cats) {
+      items.add(PopupMenuItem<ForumInfo>(
+        enabled: false,
+        height: 30,
+        child: Text(
+          cat.name.toUpperCase(),
+          style: TextStyle(
+            color: context.scheme.primary,
+            fontSize: 11.5,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 0.5,
+          ),
         ),
-      ),
+      ));
+      for (final forum in cat.forums) {
+        items.add(PopupMenuItem<ForumInfo>(
+          value: forum,
+          height: 40,
+          child: Text(forum.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+        ));
+      }
+    }
+
+    final media = MediaQuery.of(context);
+    final top = media.padding.top + kToolbarHeight;
+    final selected = await showMenu<ForumInfo>(
+      context: context,
+      color: context.scheme.surface,
+      position: RelativeRect.fromLTRB(media.size.width, top, 8, 0),
+      constraints: BoxConstraints(maxHeight: media.size.height * 0.7, minWidth: 240),
+      items: items,
     );
+    if (selected != null && context.mounted) {
+      context.openForum(selected.slug, name: selected.name);
+    }
   }
 }
 

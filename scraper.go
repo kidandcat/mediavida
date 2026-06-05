@@ -790,6 +790,7 @@ type ThreadListItem struct {
 	Replies      string
 	LastActivity string
 	UnreadCount  string // number of unread posts, empty if none
+	UnreadURL    string // link to the first unread post (.../<page>#<num>), if any
 }
 
 // parseThreadList parses threads from the table structure used by favorites and posts pages.
@@ -821,6 +822,14 @@ func parseThreadList(doc *goquery.Document) []ThreadListItem {
 		if unread == "" && a.HasClass("hb") {
 			unread = "new"
 		}
+		// Link to the first unread post (page + #num anchor).
+		unreadURL := sel.Find(".unseen-num").AttrOr("href", "")
+		if unreadURL == "" {
+			unreadURL = sel.Find("a.sp").AttrOr("href", "")
+		}
+		if unreadURL != "" && !strings.HasPrefix(unreadURL, "http") {
+			unreadURL = "https://www.mediavida.com" + unreadURL
+		}
 		if title != "" {
 			items = append(items, ThreadListItem{
 				Title:        title,
@@ -829,6 +838,7 @@ func parseThreadList(doc *goquery.Document) []ThreadListItem {
 				Replies:      replies,
 				LastActivity: activity,
 				UnreadCount:  unread,
+				UnreadURL:    unreadURL,
 			})
 		}
 	})
@@ -877,12 +887,20 @@ func (s *ForumScraper) FetchFavorites() ([]ThreadListItem, error) {
 			// Thread has new posts but we couldn't find a specific count
 			unread = "new"
 		}
+		unreadURL := sel.Find(".unseen-num").AttrOr("href", "")
+		if unreadURL == "" {
+			unreadURL = sel.Find("a.sp").AttrOr("href", "")
+		}
+		if unreadURL != "" && !strings.HasPrefix(unreadURL, "http") {
+			unreadURL = "https://www.mediavida.com" + unreadURL
+		}
 
 		if title != "" {
 			items = append(items, ThreadListItem{
 				Title:       title,
 				URL:         href,
 				UnreadCount: unread,
+				UnreadURL:   unreadURL,
 			})
 		}
 	})

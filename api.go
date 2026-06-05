@@ -870,6 +870,7 @@ type threadListItemDTO struct {
 	Replies      string `json:"replies,omitempty"`
 	LastActivity string `json:"last_activity,omitempty"`
 	UnreadCount  string `json:"unread_count,omitempty"`
+	UnreadURL    string `json:"unread_url,omitempty"`
 }
 
 func threadListItemsDTO(items []ThreadListItem) []threadListItemDTO {
@@ -877,7 +878,8 @@ func threadListItemsDTO(items []ThreadListItem) []threadListItemDTO {
 	for _, it := range items {
 		out = append(out, threadListItemDTO{
 			Title: it.Title, URL: it.URL, Forum: it.Forum,
-			Replies: it.Replies, LastActivity: it.LastActivity, UnreadCount: it.UnreadCount,
+			Replies: it.Replies, LastActivity: it.LastActivity,
+			UnreadCount: it.UnreadCount, UnreadURL: it.UnreadURL,
 		})
 	}
 	return out

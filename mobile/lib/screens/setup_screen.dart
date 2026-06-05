@@ -18,23 +18,15 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
   final _user = TextEditingController();
   final _pass = TextEditingController();
   final _code = TextEditingController();
-  final _url = TextEditingController();
   bool _busy = false;
   bool _guard = false;
   String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _url.text = ref.read(configProvider)?.baseUrl ?? 'https://mediavida-api.fly.dev';
-  }
 
   @override
   void dispose() {
     _user.dispose();
     _pass.dispose();
     _code.dispose();
-    _url.dispose();
     super.dispose();
   }
 
@@ -54,10 +46,6 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
       _error = null;
     });
     try {
-      final url = _url.text.trim();
-      if (url.isNotEmpty && url != ref.read(configProvider)?.baseUrl) {
-        await ref.read(configProvider.notifier).setBaseUrl(url);
-      }
       final api = ref.read(apiProvider);
       if (api == null) {
         setState(() => _error = 'Configuración no lista, reintenta');
@@ -178,26 +166,6 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
                               }),
                       child: const Text('Volver'),
                     ),
-                  const SizedBox(height: 8),
-                  Theme(
-                    data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
-                    child: ExpansionTile(
-                      tilePadding: EdgeInsets.zero,
-                      title: Text('Servidor', style: TextStyle(color: context.mv.textFaint, fontSize: 13)),
-                      children: [
-                        TextField(
-                          controller: _url,
-                          keyboardType: TextInputType.url,
-                          autocorrect: false,
-                          decoration: const InputDecoration(
-                            labelText: 'Backend URL',
-                            prefixIcon: Icon(Icons.link),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-                    ),
-                  ),
                 ],
               ),
             ),

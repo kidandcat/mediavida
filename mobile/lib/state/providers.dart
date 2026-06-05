@@ -17,11 +17,6 @@ class ConfigNotifier extends Notifier<AppConfig?> {
     state = await AppConfig.load();
   }
 
-  Future<void> setBaseUrl(String url) async {
-    await AppConfig.setBaseUrl(url);
-    state = state?.copyWith(baseUrl: url) ?? await AppConfig.load();
-  }
-
   Future<void> markLoggedIn() async {
     await AppConfig.setLoggedIn(true);
     state = state?.copyWith(loggedIn: true) ?? await AppConfig.load();

@@ -13,11 +13,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// [appKey] is a build-time anti-abuse secret (not a user credential), baked
 /// with --dart-define=MV_APP_KEY=... and sent on login as X-App-Key.
 class AppConfig {
-  static const appKey = String.fromEnvironment('MV_APP_KEY', defaultValue: '');
+  // Shared anti-abuse key for the official backend proxy. Baked into the app
+  // (an app key always lives on the client), overridable at build time.
+  static const appKey = String.fromEnvironment('MV_APP_KEY',
+      defaultValue: 'mvapp_8f149532c666c107ebdae87d6fba5fe9fce182d45f81e5e5');
   static const _defaultUrl =
       String.fromEnvironment('MV_API_URL', defaultValue: 'https://mediavida-api.fly.dev');
 
-  static const _kUrl = 'mv_api_url';
   static const _kDeviceToken = 'mv_device_token';
   static const _kLoggedIn = 'mv_logged_in';
 
@@ -37,19 +39,15 @@ class AppConfig {
 
   static Future<AppConfig> load() async {
     final prefs = await SharedPreferences.getInstance();
-    final url = prefs.getString(_kUrl) ?? _defaultUrl;
+    // Backend URL is hardcoded (no runtime server selector); ignore any value
+    // a previous build may have persisted, which could point at a dead host.
     var token = await _secure.read(key: _kDeviceToken) ?? '';
     if (token.isEmpty) {
       token = _genToken();
       await _secure.write(key: _kDeviceToken, value: token);
     }
     final loggedIn = prefs.getBool(_kLoggedIn) ?? false;
-    return AppConfig(baseUrl: url, deviceToken: token, loggedIn: loggedIn);
-  }
-
-  static Future<void> setBaseUrl(String url) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kUrl, url);
+    return AppConfig(baseUrl: _defaultUrl, deviceToken: token, loggedIn: loggedIn);
   }
 
   static Future<void> setLoggedIn(bool v) async {

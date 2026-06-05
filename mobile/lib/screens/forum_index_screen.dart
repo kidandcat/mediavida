@@ -7,6 +7,7 @@ import '../router.dart';
 import '../state/providers.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
+import '../widgets/forum_icon.dart';
 
 /// Home tab: the Mediavida portada (featured-thread feed). Subforums are reached
 /// through a dropdown, like the website.
@@ -86,8 +87,18 @@ class ForumIndexScreen extends ConsumerWidget {
       for (final forum in cat.forums) {
         items.add(PopupMenuItem<ForumInfo>(
           value: forum,
-          height: 40,
-          child: Text(forum.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+          height: 42,
+          child: Row(
+            children: [
+              ForumIcon(forum.icon, size: 22),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(forum.name,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                    overflow: TextOverflow.ellipsis),
+              ),
+            ],
+          ),
         ));
       }
     }

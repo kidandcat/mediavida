@@ -93,7 +93,18 @@ class _FavoriteTile extends StatelessWidget {
         trailing: item.unreadCount.isNotEmpty
             ? MvChip(item.unreadCount, color: context.mv.unread, fg: const Color(0xFF1C1F22))
             : null,
-        onTap: () => context.openThread(item.url, title: item.title, jumpToLatest: true),
+        onTap: () {
+          // With unread posts, jump to the first unread (oldest pending), like
+          // the web; otherwise open at the latest post.
+          if (item.unreadPostNum > 0) {
+            context.openThread(item.url,
+                title: item.title,
+                page: item.unreadPage > 0 ? item.unreadPage : 0,
+                scrollToPost: item.unreadPostNum);
+          } else {
+            context.openThread(item.url, title: item.title, jumpToLatest: true);
+          }
+        },
       ),
     );
   }

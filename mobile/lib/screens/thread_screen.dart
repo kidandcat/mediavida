@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../api/models.dart';
 import '../api/mv_api.dart';
@@ -16,12 +17,16 @@ class ThreadScreen extends ConsumerStatefulWidget {
   /// When true, open positioned at the newest post (used when entering from
   /// Favorites). Otherwise the thread opens at the top of the loaded page.
   final bool jumpToLatest;
+  /// When > 0, after loading scroll to (and highlight) this post number — used
+  /// to land on the first unread post of a favorited thread.
+  final int scrollToPost;
   const ThreadScreen({
     super.key,
     required this.url,
     this.title = '',
     this.initialPage = 0,
     this.jumpToLatest = false,
+    this.scrollToPost = 0,
   });
 
   @override
@@ -40,10 +45,32 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
 
   final _composer = TextEditingController();
   final _composerFocus = FocusNode();
-  final _scroll = ScrollController();
+  final ItemScrollController _itemScroll = ItemScrollController();
   String? _me;
 
+  int? _highlightNum; // briefly-highlighted post (the landed-on first unread)
+  int _pendingScrollPost = 0;
+
   bool _isLiked(Post post) => _likeOverride[post.num] ?? post.liked;
+
+  Future<void> _scrollToPost(int num) async {
+    final msgs = _page?.messages ?? const <Post>[];
+    final idx = msgs.indexWhere((m) => m.num == num);
+    if (idx < 0) return;
+    if (!_itemScroll.isAttached) await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || !_itemScroll.isAttached) return;
+    await _itemScroll.scrollTo(
+      index: idx,
+      alignment: 0.06,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOut,
+    );
+    if (!mounted) return;
+    setState(() => _highlightNum = num);
+    Future.delayed(const Duration(milliseconds: 1800), () {
+      if (mounted) setState(() => _highlightNum = null);
+    });
+  }
 
   /// Resolve a referenced post (#NNNN) for inline expansion. Uses the locally
   /// loaded post when it's on the current page (rendered HTML), otherwise
@@ -73,9 +100,10 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadUser();
-    // Load the most recent page; only jump to the newest post when requested
-    // (e.g. entering from Favorites).
-    _load(widget.initialPage, scrollToBottom: widget.jumpToLatest);
+    _pendingScrollPost = widget.scrollToPost;
+    // Load the requested page; jump to newest only when asked and not landing on
+    // a specific unread post.
+    _load(widget.initialPage, scrollToBottom: widget.jumpToLatest && widget.scrollToPost == 0);
   }
 
   Future<void> _loadUser() async {
@@ -92,7 +120,6 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     WidgetsBinding.instance.removeObserver(this);
     _composer.dispose();
     _composerFocus.dispose();
-    _scroll.dispose();
     super.dispose();
   }
 
@@ -103,32 +130,26 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
   }
 
   void _jumpToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
-        _scroll.jumpTo(_scroll.position.maxScrollExtent);
-      }
-    });
+    final n = _page?.messages.length ?? 0;
+    if (n > 0 && _itemScroll.isAttached) {
+      _itemScroll.jumpTo(index: n - 1);
+    }
   }
 
-  /// Scrolls to the true bottom. With ListView.builder the max scroll extent is
-  /// only an estimate until the last items are laid out (and grows as images
-  /// load), so we re-settle to the latest extent over several frames.
+  /// Scroll to the newest post (last item). Reliable for off-screen items.
   Future<void> _goBottom({bool animate = false}) async {
-    if (!_scroll.hasClients) {
-      await WidgetsBinding.instance.endOfFrame;
-      if (!mounted || !_scroll.hasClients) return;
-    }
+    final n = _page?.messages.length ?? 0;
+    if (n == 0) return;
+    if (!_itemScroll.isAttached) await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || !_itemScroll.isAttached) return;
     if (animate) {
-      await _scroll.animateTo(
-        _scroll.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 280),
+      await _itemScroll.scrollTo(
+        index: n - 1,
+        duration: const Duration(milliseconds: 300),
         curve: Curves.easeOut,
       );
-    }
-    for (final ms in const [0, 60, 180, 400]) {
-      await Future<void>.delayed(Duration(milliseconds: ms));
-      if (!mounted || !_scroll.hasClients) return;
-      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    } else {
+      _itemScroll.jumpTo(index: n - 1);
     }
   }
 
@@ -152,7 +173,13 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
         _page = result;
         _loading = false;
       });
-      if (scrollToBottom) _goBottom();
+      if (_pendingScrollPost > 0) {
+        final target = _pendingScrollPost;
+        _pendingScrollPost = 0;
+        _scrollToPost(target);
+      } else if (scrollToBottom) {
+        _goBottom();
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -374,8 +401,9 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     }
     return RefreshIndicator(
       onRefresh: () => _load(page.currentPage),
-      child: ListView.builder(
-        controller: _scroll,
+      child: ScrollablePositionedList.builder(
+        itemScrollController: _itemScroll,
+        physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.only(top: 6, bottom: 16),
         itemCount: page.messages.length,
         itemBuilder: (c, i) {
@@ -384,6 +412,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
             post: post,
             liked: _isLiked(post),
             mine: _isMine(post),
+            highlighted: _highlightNum == post.num,
             onAuthorTap: () => context.openUser(post.author),
             onLike: () => _toggleLike(post),
             onQuote: () => _quote(post),
@@ -520,6 +549,7 @@ class _PostCard extends StatefulWidget {
   final Post post;
   final bool liked;
   final bool mine;
+  final bool highlighted;
   final VoidCallback onAuthorTap;
   final VoidCallback onLike;
   final VoidCallback onQuote;
@@ -529,6 +559,7 @@ class _PostCard extends StatefulWidget {
     required this.post,
     required this.liked,
     required this.mine,
+    required this.highlighted,
     required this.onAuthorTap,
     required this.onLike,
     required this.onQuote,
@@ -568,6 +599,7 @@ class _PostCardState extends State<_PostCard> {
     final rel = relativeTime(post.time);
     final when = rel.isNotEmpty ? rel : post.date;
     return Card(
+      color: widget.highlighted ? context.scheme.primary.withValues(alpha: 0.16) : null,
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(

@@ -50,6 +50,7 @@ GoRouter buildRouter(WidgetRef ref) {
             title: extra['title'] as String? ?? '',
             initialPage: extra['page'] as int? ?? 0,
             jumpToLatest: extra['jumpToLatest'] as bool? ?? false,
+            scrollToPost: extra['scrollToPost'] as int? ?? 0,
           );
         },
       ),
@@ -81,9 +82,15 @@ extension MvNav on BuildContext {
       push('/forum/$slug', extra: {'name': name ?? slug});
   void openForumNewThread(String slug, {String? name}) =>
       push('/forum/$slug/new', extra: {'name': name ?? slug});
-  void openThread(String url, {String title = '', int page = 0, bool jumpToLatest = false}) =>
-      push('/thread',
-          extra: {'url': url, 'title': title, 'page': page, 'jumpToLatest': jumpToLatest});
+  void openThread(String url,
+          {String title = '', int page = 0, bool jumpToLatest = false, int scrollToPost = 0}) =>
+      push('/thread', extra: {
+        'url': url,
+        'title': title,
+        'page': page,
+        'jumpToLatest': jumpToLatest,
+        'scrollToPost': scrollToPost,
+      });
   void openConversation(String id, {String title = ''}) =>
       push('/conversation/$id', extra: {'title': title});
   void openUser(String username) => push('/user/$username');

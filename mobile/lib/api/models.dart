@@ -267,6 +267,7 @@ class ThreadListItem {
   final String replies;
   final String lastActivity;
   final String unreadCount;
+  final String unreadUrl; // link to first unread post: .../<page>#<num>
   const ThreadListItem({
     required this.title,
     required this.url,
@@ -274,6 +275,7 @@ class ThreadListItem {
     this.replies = '',
     this.lastActivity = '',
     this.unreadCount = '',
+    this.unreadUrl = '',
   });
   factory ThreadListItem.fromJson(Map<String, dynamic> j) => ThreadListItem(
         title: _s(j['title']),
@@ -282,7 +284,21 @@ class ThreadListItem {
         replies: _s(j['replies']),
         lastActivity: _s(j['last_activity']),
         unreadCount: _s(j['unread_count']),
+        unreadUrl: _s(j['unread_url']),
       );
+
+  /// Page number embedded in [unreadUrl] (.../<page>#<num>), or 0.
+  int get unreadPage {
+    if (unreadUrl.isEmpty) return 0;
+    final path = unreadUrl.split('#').first;
+    return int.tryParse(path.split('/').last) ?? 0;
+  }
+
+  /// Post number of the first unread post (the #<num> anchor), or 0.
+  int get unreadPostNum {
+    final i = unreadUrl.indexOf('#');
+    return i < 0 ? 0 : int.tryParse(unreadUrl.substring(i + 1)) ?? 0;
+  }
 }
 
 class Mention {

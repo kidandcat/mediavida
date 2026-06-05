@@ -82,7 +82,7 @@ extension MvNav on BuildContext {
       push('/forum/$slug', extra: {'name': name ?? slug});
   void openForumNewThread(String slug, {String? name}) =>
       push('/forum/$slug/new', extra: {'name': name ?? slug});
-  void openThread(String url,
+  Future<void> openThread(String url,
           {String title = '', int page = 0, bool jumpToLatest = false, int scrollToPost = 0}) =>
       push('/thread', extra: {
         'url': url,

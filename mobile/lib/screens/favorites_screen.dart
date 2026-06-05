@@ -58,13 +58,13 @@ class FavoritesScreen extends ConsumerWidget {
   }
 }
 
-class _FavoriteTile extends StatelessWidget {
+class _FavoriteTile extends ConsumerWidget {
   const _FavoriteTile({required this.item});
 
   final ThreadListItem item;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final subtitle = [
       item.forum,
       if (item.replies.isNotEmpty) '${item.replies} resp.',
@@ -93,17 +93,20 @@ class _FavoriteTile extends StatelessWidget {
         trailing: item.unreadCount.isNotEmpty
             ? MvChip(item.unreadCount, color: context.mv.unread, fg: const Color(0xFF1C1F22))
             : null,
-        onTap: () {
+        onTap: () async {
           // With unread posts, jump to the first unread (oldest pending), like
           // the web; otherwise open at the latest post.
           if (item.unreadPostNum > 0) {
-            context.openThread(item.url,
+            await context.openThread(item.url,
                 title: item.title,
                 page: item.unreadPage > 0 ? item.unreadPage : 0,
                 scrollToPost: item.unreadPostNum);
           } else {
-            context.openThread(item.url, title: item.title, jumpToLatest: true);
+            await context.openThread(item.url, title: item.title, jumpToLatest: true);
           }
+          // Reading the thread marks it read on Mediavida; refresh so the unread
+          // badges reflect the new state when we return to the list.
+          ref.invalidate(_favoritesProvider);
         },
       ),
     );

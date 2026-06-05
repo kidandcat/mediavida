@@ -50,6 +50,17 @@ class ConfigNotifier extends Notifier<AppConfig?> {
     await AppConfig.setLoggedIn(false);
     state = state?.copyWith(loggedIn: false) ?? await AppConfig.load();
   }
+
+  /// Called when any API request returns 401: the backend lost the Mediavida
+  /// session and couldn't renew it. Drop to the login screen. We don't hit the
+  /// backend logout endpoint (the session is already gone) and ignore it while
+  /// not logged in, so it never interferes with the login flow itself.
+  void handleUnauthorized() {
+    final cfg = state;
+    if (cfg == null || !cfg.loggedIn) return;
+    AppConfig.setLoggedIn(false);
+    state = cfg.copyWith(loggedIn: false);
+  }
 }
 
 final configProvider =
@@ -59,7 +70,11 @@ final configProvider =
 final apiProvider = Provider<MvApi?>((ref) {
   final cfg = ref.watch(configProvider);
   if (cfg == null || cfg.deviceToken.isEmpty) return null;
-  return MvApi(baseUrl: cfg.baseUrl, token: cfg.deviceToken);
+  return MvApi(
+    baseUrl: cfg.baseUrl,
+    token: cfg.deviceToken,
+    onUnauthorized: () => ref.read(configProvider.notifier).handleUnauthorized(),
+  );
 });
 
 /// The homepage portada feed (featured threads).

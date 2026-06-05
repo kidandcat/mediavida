@@ -27,7 +27,7 @@ class MvApiException implements Exception {
 
 /// Client for the reverse-engineered Mediavida backend (mediavida-api on Fly).
 class MvApi {
-  MvApi({required String baseUrl, required String token})
+  MvApi({required String baseUrl, required String token, this.onUnauthorized})
       : _baseUrl = baseUrl.replaceAll(RegExp(r'/+$'), ''),
         _token = token,
         _dio = Dio(BaseOptions(
@@ -37,7 +37,20 @@ class MvApi {
           receiveTimeout: const Duration(seconds: 40),
           // We handle non-2xx ourselves to surface API error messages.
           validateStatus: (s) => s != null && s < 500,
-        ));
+        )) {
+    // A 401 from any endpoint means the backend lost the Mediavida session and
+    // could not renew it: tell the app to drop to the login screen.
+    _dio.interceptors.add(InterceptorsWrapper(
+      onResponse: (response, handler) {
+        if (response.statusCode == 401) onUnauthorized?.call();
+        handler.next(response);
+      },
+    ));
+  }
+
+  /// Invoked when the backend reports the session is gone (HTTP 401), so the
+  /// app can sign out and prompt for login again. Never called for login calls.
+  final void Function()? onUnauthorized;
 
   final String _baseUrl;
   final String _token;
@@ -274,6 +287,7 @@ class MvApi {
         ..headers['Accept'] = 'text/event-stream';
       final resp = await client.send(req);
       if (resp.statusCode != 200) {
+        if (resp.statusCode == 401) onUnauthorized?.call();
         throw MvApiException('events stream failed', resp.statusCode);
       }
       String event = '';

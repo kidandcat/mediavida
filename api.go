@@ -57,7 +57,15 @@ func requireAuthenticated(w http.ResponseWriter, r *http.Request, sessions *Sess
 	return s.Scraper, clientID
 }
 
-// withRelogin runs fn; if it returns ErrSessionExpired it relogs in once and retries.
+// errReauthRequired marks an error meaning the Mediavida session is gone and
+// could not be renewed automatically (e.g. guard verification now required).
+// The app must prompt the user to log in again. Mapped to HTTP 401 by
+// writeAPIError so the client can drop to the login screen.
+var errReauthRequired = errors.New("session expired, re-authentication required")
+
+// withRelogin runs fn; if it returns ErrSessionExpired it relogs in once and
+// retries. If the re-login itself fails the session can no longer be renewed
+// without the user, so it returns an error wrapping errReauthRequired (→ 401).
 func withRelogin(scraper *ForumScraper, fn func() error) error {
 	err := fn()
 	if err == nil {
@@ -69,9 +77,20 @@ func withRelogin(scraper *ForumScraper, fn func() error) error {
 	}
 	log.Printf("[api] session invalid for %s, attempting re-login", scraper.Username())
 	if rerr := scraper.Relogin(); rerr != nil {
-		return fmt.Errorf("session expired and re-login failed: %w", rerr)
+		return fmt.Errorf("%w: %v", errReauthRequired, rerr)
 	}
 	return fn()
+}
+
+// writeAPIError maps a data-endpoint error to an HTTP status: 401 when the
+// Mediavida session is gone and must be re-established by the user (so the app
+// shows the login screen), 502 otherwise (upstream scrape/parse failure).
+func writeAPIError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errReauthRequired) {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeError(w, http.StatusBadGateway, err.Error())
 }
 
 // --- auth endpoints ---
@@ -199,7 +218,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return e
 		})
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
@@ -217,7 +236,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return e
 		})
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"categories": cats})
@@ -246,7 +265,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return e
 		})
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, list)
@@ -275,7 +294,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return nil
 		})
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -299,7 +318,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return
 		}
 		if err := scraper.LikeMessage(req.PostNum); err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -327,7 +346,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return
 		}
 		if err := scraper.PostReply(req.Text, req.ReplyToNum); err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -347,7 +366,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		src, err := scraper.GetPostSource(num)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"num": num, "source": src})
@@ -366,7 +385,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		author, bodyHTML, err := scraper.GetQuotedPost(num)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"num": num, "author": author, "body_html": bodyHTML})
@@ -395,7 +414,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return
 		}
 		if err := scraper.EditMessage(req.PostNum, req.Text); err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -428,7 +447,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		raw, err := scraper.CreateThread(req.Subforum, req.Title, req.Body, req.Tag, req.AddToFavorites)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -459,7 +478,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		page, err := scraper.FetchNewThreadPage(subforum)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -483,7 +502,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		results, err := scraper.Search(query)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -501,7 +520,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 		items, err := scraper.FetchInbox(page)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -523,7 +542,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		conv, err := scraper.FetchConversation(id)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -553,7 +572,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		err := withRelogin(scraper, func() error { return scraper.SendPrivateMessage(id, req.Text) })
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -568,7 +587,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		items, err := scraper.FetchFavorites()
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -586,7 +605,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		items, err := scraper.FetchUserPosts(username)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -607,7 +626,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		items, err := scraper.FetchMentions(username)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		scraper.AutoSave()
@@ -633,7 +652,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return nil
 		})
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]int{
@@ -737,7 +756,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return nil
 		})
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeAPIError(w, err)
 			return
 		}
 		if mb == nil {

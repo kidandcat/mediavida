@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -139,6 +141,36 @@ func (ss *SessionStore) AutoLogin(clientID, user, pass string) error {
 	}
 	ss.Set(clientID, &Session{Scraper: scraper, Status: "authenticated"})
 	return nil
+}
+
+// RestoreAllFromDisk restores every persisted session found on disk (including
+// per-device app-login tokens, not just the configured API tokens). Returns the
+// number of sessions restored. Call once at boot so logins survive restarts.
+func (ss *SessionStore) RestoreAllFromDisk() int {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return 0
+	}
+	dir := filepath.Join(base, "mediavida-mcp")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "session-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		token := strings.TrimSuffix(strings.TrimPrefix(name, "session-"), ".json")
+		if token == "" || ss.Get(token) != nil {
+			continue
+		}
+		if ss.RestoreFromDisk(token) {
+			n++
+		}
+	}
+	return n
 }
 
 // ForEach calls fn for each stored session while holding a read lock.

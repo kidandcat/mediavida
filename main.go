@@ -84,6 +84,12 @@ func main() {
 		}
 	}
 
+	// Restore per-device app-login sessions persisted on disk (the volume), so
+	// users stay logged in across restarts and redeploys.
+	if n := sessions.RestoreAllFromDisk(); n > 0 {
+		log.Printf("Restored %d per-device session(s) from disk", n)
+	}
+
 	var baseURL string
 	if envURL := os.Getenv("BASE_URL"); envURL != "" {
 		baseURL = strings.TrimRight(envURL, "/")

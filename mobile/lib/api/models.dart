@@ -40,6 +40,31 @@ class ForumCategory {
       );
 }
 
+class PortadaItem {
+  final String title;
+  final String url;
+  final String forum;
+  final String intro;
+  final String image;
+  final String replies;
+  const PortadaItem({
+    required this.title,
+    required this.url,
+    this.forum = '',
+    this.intro = '',
+    this.image = '',
+    this.replies = '',
+  });
+  factory PortadaItem.fromJson(Map<String, dynamic> j) => PortadaItem(
+        title: _s(j['title']),
+        url: _s(j['url']),
+        forum: _s(j['forum']),
+        intro: _s(j['intro']),
+        image: _s(j['image']),
+        replies: _s(j['replies']),
+      );
+}
+
 class ForumThread {
   final String id;
   final String title;

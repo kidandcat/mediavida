@@ -43,58 +43,29 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
   final _scroll = ScrollController();
   String? _me;
 
-  // Per-post keys (to scroll to a referenced #NNNN) and the briefly-highlighted post.
-  final Map<int, GlobalKey> _postKeys = {};
-  int? _highlightNum;
-
   bool _isLiked(Post post) => _likeOverride[post.num] ?? post.liked;
 
-  Future<void> _openPostRef(int num) async {
-    final key = _postKeys[num];
-    if (key?.currentContext != null) {
-      await Scrollable.ensureVisible(key!.currentContext!,
-          duration: const Duration(milliseconds: 350), alignment: 0.15);
-      if (!mounted) return;
-      setState(() => _highlightNum = num);
-      Future.delayed(const Duration(milliseconds: 1600), () {
-        if (mounted) setState(() => _highlightNum = null);
-      });
-      return;
+  /// Resolve a referenced post (#NNNN) for inline expansion. Uses the locally
+  /// loaded post when it's on the current page (rendered HTML), otherwise
+  /// fetches its text from the backend.
+  Future<RefPost?> _fetchRef(int num) async {
+    for (final m in _page?.messages ?? const <Post>[]) {
+      if (m.num == num) {
+        return RefPost(
+          author: m.author,
+          bodyHtml: m.bodyHtml.trim().isNotEmpty ? m.bodyHtml : null,
+          bodyText: m.bodyHtml.trim().isEmpty ? m.body : null,
+        );
+      }
     }
-    // Referenced post is on another page: fetch its text and show it.
     final api = ref.read(apiProvider);
-    if (api == null) return;
-    String text;
+    if (api == null) return null;
     try {
-      text = await api.quotedPost(num);
-    } catch (e) {
-      _snack(e is MvApiException ? e.message : '$e');
-      return;
+      final text = await api.quotedPost(num);
+      return RefPost(author: '', bodyText: text);
+    } catch (_) {
+      return null;
     }
-    if (!mounted || text.trim().isEmpty) return;
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: context.scheme.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) => DraggableScrollableSheet(
-        expand: false,
-        initialChildSize: 0.5,
-        maxChildSize: 0.85,
-        builder: (c, scrollCtrl) => ListView(
-          controller: scrollCtrl,
-          padding: const EdgeInsets.all(16),
-          children: [
-            Text('Mensaje #$num',
-                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
-            const SizedBox(height: 10),
-            SelectableText(text, style: const TextStyle(fontSize: 15, height: 1.4)),
-          ],
-        ),
-      ),
-    );
   }
 
   @override
@@ -410,16 +381,14 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
         itemBuilder: (c, i) {
           final post = page.messages[i];
           return _PostCard(
-            key: _postKeys.putIfAbsent(post.num, () => GlobalKey()),
             post: post,
             liked: _isLiked(post),
             mine: _isMine(post),
-            highlighted: _highlightNum == post.num,
             onAuthorTap: () => context.openUser(post.author),
             onLike: () => _toggleLike(post),
             onQuote: () => _quote(post),
             onEdit: () => _startEdit(post),
-            onPostRef: _openPostRef,
+            fetchRef: _fetchRef,
           );
         },
       ),
@@ -539,35 +508,66 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
   }
 }
 
-class _PostCard extends StatelessWidget {
+/// A referenced post resolved for inline expansion.
+class RefPost {
+  final String author;
+  final String? bodyHtml;
+  final String? bodyText;
+  RefPost({required this.author, this.bodyHtml, this.bodyText});
+}
+
+class _PostCard extends StatefulWidget {
   final Post post;
   final bool liked;
   final bool mine;
-  final bool highlighted;
   final VoidCallback onAuthorTap;
   final VoidCallback onLike;
   final VoidCallback onQuote;
   final VoidCallback onEdit;
-  final void Function(int postNum) onPostRef;
+  final Future<RefPost?> Function(int postNum) fetchRef;
   const _PostCard({
-    super.key,
     required this.post,
     required this.liked,
     required this.mine,
-    required this.highlighted,
     required this.onAuthorTap,
     required this.onLike,
     required this.onQuote,
     required this.onEdit,
-    required this.onPostRef,
+    required this.fetchRef,
   });
 
   @override
+  State<_PostCard> createState() => _PostCardState();
+}
+
+class _PostCardState extends State<_PostCard> {
+  // Inline-expanded references: num -> content (null while loading).
+  final Map<int, RefPost?> _refs = {};
+  final Set<int> _loading = {};
+
+  Future<void> _toggleRef(int num) async {
+    if (_refs.containsKey(num)) {
+      setState(() => _refs.remove(num)); // collapse
+      return;
+    }
+    setState(() {
+      _refs[num] = null;
+      _loading.add(num);
+    });
+    final rp = await widget.fetchRef(num);
+    if (!mounted) return;
+    setState(() {
+      _loading.remove(num);
+      _refs[num] = rp ?? RefPost(author: '', bodyText: 'No se pudo cargar el mensaje #$num');
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final post = widget.post;
     final rel = relativeTime(post.time);
     final when = rel.isNotEmpty ? rel : post.date;
     return Card(
-      color: highlighted ? context.scheme.primary.withValues(alpha: 0.16) : null,
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
@@ -582,7 +582,7 @@ class _PostCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       InkWell(
-                        onTap: onAuthorTap,
+                        onTap: widget.onAuthorTap,
                         child: Text(
                           post.author,
                           style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
@@ -601,30 +601,39 @@ class _PostCard extends StatelessWidget {
             ),
             const SizedBox(height: 10),
             post.bodyHtml.trim().isNotEmpty
-                ? PostHtml(post.bodyHtml, onPostRef: onPostRef)
+                ? PostHtml(post.bodyHtml, onPostRef: _toggleRef)
                 : Text(post.body, style: const TextStyle(fontSize: 15, height: 1.45)),
+            // Inline-expanded references appear right below the body, like the web.
+            for (final num in _refs.keys)
+              _RefBox(
+                num: num,
+                content: _refs[num],
+                loading: _loading.contains(num),
+                onClose: () => _toggleRef(num),
+                onRefTap: _toggleRef,
+              ),
             const SizedBox(height: 6),
             Row(
               children: [
                 TextButton.icon(
-                  onPressed: onLike,
+                  onPressed: widget.onLike,
                   icon: Icon(
-                    liked ? Icons.thumb_up : Icons.thumb_up_outlined,
+                    widget.liked ? Icons.thumb_up : Icons.thumb_up_outlined,
                     size: 18,
-                    color: liked ? context.scheme.primary : context.mv.textSecondary,
+                    color: widget.liked ? context.scheme.primary : context.mv.textSecondary,
                   ),
                   label: Text(
                     'Me gusta',
                     style: TextStyle(
                       fontSize: 13,
-                      color: liked ? context.scheme.primary : context.mv.textSecondary,
+                      color: widget.liked ? context.scheme.primary : context.mv.textSecondary,
                     ),
                   ),
                 ),
                 const Spacer(),
-                if (mine)
+                if (widget.mine)
                   TextButton.icon(
-                    onPressed: onEdit,
+                    onPressed: widget.onEdit,
                     icon: Icon(Icons.edit_outlined, size: 18, color: context.mv.textSecondary),
                     label: Text(
                       'Editar',
@@ -632,7 +641,7 @@ class _PostCard extends StatelessWidget {
                     ),
                   ),
                 TextButton.icon(
-                  onPressed: onQuote,
+                  onPressed: widget.onQuote,
                   icon: Icon(Icons.reply, size: 18, color: context.mv.textSecondary),
                   label: Text(
                     'Responder',
@@ -643,6 +652,71 @@ class _PostCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Inline-expanded referenced post, shown within a message (like the web).
+class _RefBox extends StatelessWidget {
+  final int num;
+  final RefPost? content;
+  final bool loading;
+  final VoidCallback onClose;
+  final void Function(int) onRefTap;
+  const _RefBox({
+    required this.num,
+    required this.content,
+    required this.loading,
+    required this.onClose,
+    required this.onRefTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.fromLTRB(10, 6, 6, 8),
+      decoration: BoxDecoration(
+        color: context.mv.surfaceHigh.withValues(alpha: 0.5),
+        border: Border(left: BorderSide(color: context.scheme.primary, width: 3)),
+        borderRadius: const BorderRadius.only(
+          topRight: Radius.circular(8),
+          bottomRight: Radius.circular(8),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                content != null && content!.author.isNotEmpty ? '#$num · ${content!.author}' : '#$num',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                  color: context.scheme.primary,
+                ),
+              ),
+              const Spacer(),
+              InkWell(
+                onTap: onClose,
+                child: Icon(Icons.close, size: 16, color: context.mv.textFaint),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          if (loading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 6),
+              child: SizedBox(
+                  height: 16, width: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+            )
+          else if (content?.bodyHtml != null && content!.bodyHtml!.trim().isNotEmpty)
+            PostHtml(content!.bodyHtml!, onPostRef: onRefTap)
+          else
+            Text(content?.bodyText ?? '', style: const TextStyle(fontSize: 14, height: 1.4)),
+        ],
       ),
     );
   }

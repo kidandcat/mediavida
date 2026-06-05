@@ -62,6 +62,13 @@ final apiProvider = Provider<MvApi?>((ref) {
   return MvApi(baseUrl: cfg.baseUrl, token: cfg.deviceToken);
 });
 
+/// The homepage portada feed (featured threads).
+final portadaProvider = FutureProvider<List<PortadaItem>>((ref) async {
+  final api = ref.watch(apiProvider);
+  if (api == null) return [];
+  return api.portada();
+});
+
 /// The forum index (categories + subforums).
 final forumsProvider = FutureProvider<List<ForumCategory>>((ref) async {
   final api = ref.watch(apiProvider);

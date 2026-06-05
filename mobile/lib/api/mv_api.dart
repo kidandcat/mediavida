@@ -117,6 +117,13 @@ class MvApi {
 
   // --- forum browse ---
 
+  Future<List<PortadaItem>> portada() async {
+    final d = _obj(await _dio.get('/portada'));
+    return ((d['items'] as List?) ?? [])
+        .map((e) => PortadaItem.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
   Future<List<ForumCategory>> forums() async {
     final d = _obj(await _dio.get('/forums'));
     return ((d['categories'] as List?) ?? [])

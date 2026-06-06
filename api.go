@@ -117,7 +117,7 @@ type webAuthResponse struct {
 }
 
 // RegisterAPIRoutes wires all REST endpoints under the given mux.
-func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *WebhookStore, modForums *ModForumsStore, hub *EventHub, baseURL string) {
+func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *WebhookStore, modForums *ModForumsStore, hub *EventHub, fcmTokens *FCMTokenStore, baseURL string) {
 	// --- auth ---
 	mux.HandleFunc("POST /auth/login", func(w http.ResponseWriter, r *http.Request) {
 		var req loginRequest
@@ -195,6 +195,37 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		}
 		sessions.Set(clientID, nil)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
+	})
+
+	// Register / unregister this device's FCM token for push notifications.
+	mux.HandleFunc("POST /push/register", func(w http.ResponseWriter, r *http.Request) {
+		clientID := ClientIDFromContext(r.Context())
+		var req struct {
+			Token string `json:"token"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(req.Token) == "" {
+			writeError(w, http.StatusBadRequest, "token is required")
+			return
+		}
+		fcmTokens.Add(clientID, strings.TrimSpace(req.Token))
+		writeJSON(w, http.StatusOK, map[string]string{"status": "registered"})
+	})
+
+	mux.HandleFunc("DELETE /push/register", func(w http.ResponseWriter, r *http.Request) {
+		clientID := ClientIDFromContext(r.Context())
+		var req struct {
+			Token string `json:"token"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		fcmTokens.Remove(clientID, strings.TrimSpace(req.Token))
+		writeJSON(w, http.StatusOK, map[string]string{"status": "unregistered"})
 	})
 
 	mux.HandleFunc("POST /auth/web", func(w http.ResponseWriter, r *http.Request) {

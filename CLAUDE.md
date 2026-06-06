@@ -32,11 +32,17 @@ the work account.
 
 - **`mediavida-api`** — the REST API / scraper backend.
 - **`mediavida-ntfy`** — self-hosted ntfy for push (see `deploy/ntfy/README.md`).
-- Firebase project for FCM push: **personal account** (being set up).
+- **Firebase project `mediavida-push`** (personal account) — FCM for push.
+  Service account `fcm-sender@mediavida-push…` → key in `mediavida-api` secret
+  `FCM_SA_JSON` (+ `FCM_PROJECT_ID`). Client config (`google-services.json`,
+  `firebase_options.dart`, plist) is committed — those are public client keys.
 
 ## Push notifications
 
 - Backend pushes when a user's bubble counters rise (avisos/MPs/favoritos),
-  never on reads — see `ntfy.go` and the FCM path (in progress).
-- App: `mobile/lib/core/notification_service.dart` (ntfy SSE today; FCM being
-  added for reliable Android+iOS delivery with the app closed).
+  never on reads. Two paths, both fired from the bubbles poller:
+  - **FCM** (`fcm.go`) — primary; reliable Android+iOS delivery with the app
+    closed. Devices register their FCM token via `POST /push/register`.
+  - **ntfy** (`ntfy.go`) — also published (harmless; usable via the ntfy app).
+- App: `mobile/lib/core/notification_service.dart` uses `firebase_messaging`;
+  Android verified E2E. **iOS still needs the APNs key uploaded to Firebase.**

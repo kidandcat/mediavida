@@ -108,9 +108,14 @@ func main() {
 	// Optional ntfy push publisher (nil if NTFY_URL/NTFY_TOKEN unset)
 	ntfyPub := NewNtfyPublisher()
 
+	// FCM push (nil if FCM_SA_JSON/FCM_PROJECT_ID unset). Per-device tokens are
+	// registered via POST /push/register.
+	fcmTokens := NewFCMTokenStore()
+	fcmSender := NewFCMSender(fcmTokens)
+
 	// Start bubbles poller for SSE/webhook push notifications. Mod-forum
 	// subscriptions are per-user and configured via /mod/forums.
-	poller := NewBubblesPoller(hub, sessions, webhooks, telegramBot, ntfyPub, modForums)
+	poller := NewBubblesPoller(hub, sessions, webhooks, telegramBot, ntfyPub, fcmSender, modForums)
 	poller.Start()
 
 	// Start session keepalive to prevent cookies from expiring during idle periods
@@ -124,7 +129,7 @@ func main() {
 
 	// REST API mux — everything here requires Authorization: Bearer <token>.
 	apiMux := http.NewServeMux()
-	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, baseURL)
+	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, fcmTokens, baseURL)
 
 	apiHandler := APITokenMiddleware(apiTokens, sessions, apiMux)
 

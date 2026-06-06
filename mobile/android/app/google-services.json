@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "252988759742",
+    "project_id": "mediavida-push",
+    "storage_bucket": "mediavida-push.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:252988759742:android:3edc96d9053b81953688ef",
+        "android_client_info": {
+          "package_name": "com.kidandcat.mvmobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCDR1dE9_UESugrR-ZqX8dys2i8Yf7btbw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

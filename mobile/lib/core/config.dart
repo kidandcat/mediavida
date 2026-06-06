@@ -20,6 +20,9 @@ class AppConfig {
   static const _defaultUrl =
       String.fromEnvironment('MV_API_URL', defaultValue: 'https://mediavida-api.fly.dev');
 
+  /// The hardcoded backend base URL (for non-config consumers like push).
+  static String get apiBaseUrl => _defaultUrl;
+
   static const _kDeviceToken = 'mv_device_token';
   static const _kLoggedIn = 'mv_logged_in';
 

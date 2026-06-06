@@ -1,0 +1,36 @@
+app = 'mediavida-ntfy'
+primary_region = 'cdg'
+
+[build]
+
+[deploy]
+  strategy = 'immediate'
+
+[env]
+  NTFY_BASE_URL = 'https://mediavida-ntfy.fly.dev'
+  NTFY_CACHE_FILE = '/var/lib/ntfy/cache.db'
+  NTFY_AUTH_FILE = '/var/lib/ntfy/auth.db'
+  NTFY_ATTACHMENT_CACHE_DIR = '/var/lib/ntfy/attachments'
+  NTFY_BEHIND_PROXY = 'true'
+  # Topics are secret (derived from the per-device token), but access is still
+  # locked down: anonymous read on mv_* (so the app subscribes without creds),
+  # and a publisher token (NTFY_TOKEN on mediavida-api) for writes. Configured
+  # once via `fly ssh console` — see deploy/ntfy/README.md.
+  NTFY_AUTH_DEFAULT_ACCESS = 'deny-all'
+
+[[mounts]]
+  source = 'ntfy_data'
+  destination = '/var/lib/ntfy'
+
+[http_service]
+  internal_port = 80
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1

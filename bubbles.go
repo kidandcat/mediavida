@@ -23,6 +23,7 @@ type BubblesPoller struct {
 	sessions  *SessionStore
 	webhooks  *WebhookStore
 	telegram  *TelegramBot
+	ntfy      *NtfyPublisher  // push notifications (nil when not configured)
 	modForums *ModForumsStore // per-mv-user subforum subscriptions
 
 	mu             sync.Mutex
@@ -34,13 +35,14 @@ type BubblesPoller struct {
 	refreshCounter int                                       // counts polls to periodically refresh sessions via main page
 }
 
-func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, modForums *ModForumsStore) *BubblesPoller {
+func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, ntfy *NtfyPublisher, modForums *ModForumsStore) *BubblesPoller {
 	prevMod, prevReports := loadModState()
 	return &BubblesPoller{
 		hub:         hub,
 		sessions:    sessions,
 		webhooks:    webhooks,
 		telegram:    telegram,
+		ntfy:        ntfy,
 		modForums:   modForums,
 		prev:        make(map[string]*Bubbles),
 		prevMod:     prevMod,
@@ -184,6 +186,8 @@ func (bp *BubblesPoller) check() {
 
 			bp.notifyClient(clientID, current)
 			bp.webhooks.Send(s.Scraper.Username(), current)
+			// Push only the counters that went up (new activity); never on reads.
+			bp.ntfy.NotifyBubbleIncrease(clientID, prev, current)
 			// Save session after change to persist any refreshed cookies
 			s.Scraper.SaveSession()
 		}

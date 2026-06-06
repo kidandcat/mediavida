@@ -105,9 +105,12 @@ func main() {
 	telegramBot := NewTelegramBot()
 	telegramBot.Start()
 
+	// Optional ntfy push publisher (nil if NTFY_URL/NTFY_TOKEN unset)
+	ntfyPub := NewNtfyPublisher()
+
 	// Start bubbles poller for SSE/webhook push notifications. Mod-forum
 	// subscriptions are per-user and configured via /mod/forums.
-	poller := NewBubblesPoller(hub, sessions, webhooks, telegramBot, modForums)
+	poller := NewBubblesPoller(hub, sessions, webhooks, telegramBot, ntfyPub, modForums)
 	poller.Start()
 
 	// Start session keepalive to prevent cookies from expiring during idle periods

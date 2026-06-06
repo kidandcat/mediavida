@@ -181,6 +181,12 @@ class MvTheme {
           ),
         ),
       ),
+      // Notification count badges: Mediavida's red (danger #e03d3d), not the
+      // Material 3 default which renders pink-ish.
+      badgeTheme: const BadgeThemeData(
+        backgroundColor: Color(0xFFE03D3D),
+        textColor: Colors.white,
+      ),
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
         backgroundColor: ext.surfaceHigh,

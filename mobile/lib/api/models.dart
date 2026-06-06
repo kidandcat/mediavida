@@ -326,6 +326,39 @@ class Mention {
       );
 }
 
+/// A notification from the user's notifications feed (the `bn` bubble): a quote,
+/// a group post, etc. [unseen] marks the ones still unread on this fetch.
+class MvNotification {
+  final String id;
+  final String author;
+  final String avatar;
+  final String text;
+  final String target;
+  final String url;
+  final String time;
+  final bool unseen;
+  const MvNotification({
+    required this.id,
+    required this.author,
+    this.avatar = '',
+    this.text = '',
+    this.target = '',
+    this.url = '',
+    this.time = '',
+    this.unseen = false,
+  });
+  factory MvNotification.fromJson(Map<String, dynamic> j) => MvNotification(
+        id: _s(j['id']),
+        author: _s(j['author']),
+        avatar: _s(j['avatar']),
+        text: _s(j['text']),
+        target: _s(j['target']),
+        url: _s(j['url']),
+        time: _s(j['time']),
+        unseen: j['unseen'] == true,
+      );
+}
+
 class Bubbles {
   final int messages;
   final int notifications;

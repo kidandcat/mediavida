@@ -77,6 +77,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
         selectedIndex: _index,
         onDestinationSelected: (i) {
           setState(() => _index = i);
+          ref.read(homeTabProvider.notifier).select(i);
           _refreshBubbles();
         },
         destinations: [

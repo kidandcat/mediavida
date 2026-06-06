@@ -1008,6 +1008,56 @@ func (s *ForumScraper) FetchMentions(username string) ([]MentionItem, error) {
 	return items, nil
 }
 
+// NotificationItem represents one entry of the user's notifications page
+// (citas, group posts, etc.) — the feed behind the "bn" bubble counter.
+type NotificationItem struct {
+	ID     string
+	Author string
+	Avatar string
+	Text   string // full phrasing, e.g. "MisKo te ha citado en <thread>"
+	Target string // the linked thread/section title
+	URL    string // absolute link to the post/section
+	Time   string
+	Unseen bool // set by the caller from the unread counter
+}
+
+// FetchNotifications returns the user's notifications. Visiting this page marks
+// all notifications as seen server-side (Mediavida has no per-item mark), so the
+// bn bubble drops to 0 after this call.
+func (s *ForumScraper) FetchNotifications() ([]NotificationItem, error) {
+	if !s.loggedIn {
+		return nil, &ErrSessionExpired{}
+	}
+	resp, err := s.doGet("https://www.mediavida.com/notificaciones")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var items []NotificationItem
+	doc.Find("ul.notify > li[id]").Each(func(i int, li *goquery.Selection) {
+		body := li.Find(".firma-body").First()
+		bq := body.Find("blockquote").First()
+		if bq.Length() == 0 {
+			return
+		}
+		action := bq.Find("a.action").First()
+		items = append(items, NotificationItem{
+			ID:     strings.TrimPrefix(li.AttrOr("id", ""), "f_"),
+			Author: strings.TrimSpace(bq.Find("a.autor").First().Text()),
+			Avatar: absolutizeMV(li.Find(".firma-avatar img").First().AttrOr("src", "")),
+			Text:   strings.Join(strings.Fields(bq.Text()), " "),
+			Target: strings.TrimSpace(action.Text()),
+			URL:    absolutizeMV(action.AttrOr("href", "")),
+			Time:   strings.TrimSpace(body.Find("span.n").First().Text()),
+		})
+	})
+	return items, nil
+}
+
 // Bubbles represents the notification counters from MV's bubbles.php endpoint.
 type Bubbles struct {
 	Messages      int `json:"bm"`

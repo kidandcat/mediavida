@@ -636,6 +636,38 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		})
 	})
 
+	mux.HandleFunc("GET /notifications", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		// Capture the unread count BEFORE fetching: visiting /notificaciones
+		// marks everything seen, so afterwards the bubble would read 0. The
+		// newest `unread` items are the unseen ones (feed is newest-first).
+		unread := 0
+		if b, err := scraper.FetchBubbles(); err == nil {
+			unread = b.Notifications
+		}
+		var items []NotificationItem
+		err := withRelogin(scraper, func() error {
+			var e error
+			items, e = scraper.FetchNotifications()
+			return e
+		})
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		for i := range items {
+			items[i].Unseen = i < unread
+		}
+		scraper.AutoSave()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"unread":        unread,
+			"notifications": notificationsDTO(items),
+		})
+	})
+
 	// --- bubbles / events / webhook ---
 	mux.HandleFunc("GET /bubbles", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)
@@ -919,6 +951,28 @@ func mentionsDTO(items []MentionItem) []mentionDTO {
 		out = append(out, mentionDTO{
 			ThreadTitle: it.ThreadTitle, ThreadURL: it.ThreadURL,
 			Author: it.Author, PostNum: it.PostNum, Body: it.Body, Date: it.Date,
+		})
+	}
+	return out
+}
+
+type notificationDTO struct {
+	ID     string `json:"id"`
+	Author string `json:"author"`
+	Avatar string `json:"avatar,omitempty"`
+	Text   string `json:"text"`
+	Target string `json:"target,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Time   string `json:"time,omitempty"`
+	Unseen bool   `json:"unseen"`
+}
+
+func notificationsDTO(items []NotificationItem) []notificationDTO {
+	out := make([]notificationDTO, 0, len(items))
+	for _, it := range items {
+		out = append(out, notificationDTO{
+			ID: it.ID, Author: it.Author, Avatar: it.Avatar, Text: it.Text,
+			Target: it.Target, URL: it.URL, Time: it.Time, Unseen: it.Unseen,
 		})
 	}
 	return out

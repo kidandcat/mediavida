@@ -4,6 +4,26 @@ import '../api/models.dart';
 import '../api/mv_api.dart';
 import '../core/config.dart';
 
+/// Index of the currently selected bottom-nav tab. Lets a tab kept alive by
+/// IndexedStack know whether it is actually on screen (e.g. to avoid loading
+/// notifications—which marks them seen—before the user opens that tab).
+class HomeTabNotifier extends Notifier<int> {
+  @override
+  int build() => 0;
+  void select(int i) => state = i;
+}
+
+final homeTabProvider = NotifierProvider<HomeTabNotifier, int>(HomeTabNotifier.new);
+
+/// Notifications feed for the "Avisos" tab. autoDispose so leaving and
+/// re-entering the tab refetches (and re-marks as seen) fresh data.
+final notificationsProvider =
+    FutureProvider.autoDispose<List<MvNotification>>((ref) async {
+  final api = ref.watch(apiProvider);
+  if (api == null) return const <MvNotification>[];
+  return api.notifications();
+});
+
 /// Holds the current app config (base URL + device token + login state).
 /// Null until loaded.
 class ConfigNotifier extends Notifier<AppConfig?> {

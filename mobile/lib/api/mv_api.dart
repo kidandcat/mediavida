@@ -266,6 +266,15 @@ class MvApi {
         .toList();
   }
 
+  /// Fetches the notifications feed. The backend visits Mediavida's
+  /// notifications page, which marks them all as seen (so the bn bubble clears).
+  Future<List<MvNotification>> notifications() async {
+    final d = _obj(await _dio.get('/notifications'));
+    return ((d['notifications'] as List?) ?? [])
+        .map((e) => MvNotification.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
   // --- notifications ---
 
   Future<Bubbles> bubbles() async {

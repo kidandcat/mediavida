@@ -100,7 +100,7 @@ class _NotificationCard extends StatelessWidget {
           : null,
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
-        onTap: n.url.isEmpty ? null : () => context.openThread(n.url, title: target),
+        onTap: n.url.isEmpty ? null : () => context.openThreadFromUrl(n.url, title: target),
         child: Padding(
           padding: const EdgeInsets.all(14),
           child: Row(

@@ -21,6 +21,22 @@ class PostHtml extends StatelessWidget {
     return HtmlWidget(
       html,
       textStyle: TextStyle(fontSize: 15, height: 1.45, color: context.scheme.onSurface),
+      // Mediavida spoiler/NSFW tags: render a collapsible box instead of the
+      // dead `<a href="#">` + hidden content div.
+      customWidgetBuilder: (element) {
+        if (!element.classes.contains('spoiler-wrap')) return null;
+        final label = element.querySelector('a.spoiler')?.text.trim();
+        // The actual content lives in the sibling `div.spoiler` (display:none).
+        final content = element.children
+            .where((c) => c.localName == 'div' && c.classes.contains('spoiler'))
+            .map((c) => c.innerHtml)
+            .join();
+        return _Spoiler(
+          label: (label == null || label.isEmpty) ? 'Spoiler' : label,
+          innerHtml: content,
+          onPostRef: onPostRef,
+        );
+      },
       onTapUrl: (url) async {
         // Intercept references to other posts (#NNNN) and open them in-app.
         final ref = RegExp(r'#(\d+)$').firstMatch(url);
@@ -37,6 +53,11 @@ class PostHtml extends StatelessWidget {
         return false;
       },
       customStylesBuilder: (e) {
+        // Links and #NNNN post references are both <a>: drop the underline but
+        // keep the accent color the theme already applies.
+        if (e.localName == 'a') {
+          return {'text-decoration': 'none'};
+        }
         if (e.localName == 'blockquote') {
           return {
             'border-left': '3px solid $accentHex',
@@ -57,6 +78,70 @@ class PostHtml extends StatelessWidget {
 /// CSS hex string (#rrggbb) for a [Color].
 String _hex(Color c) =>
     '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+/// Collapsible spoiler/NSFW box, like the web's `spoiler-wrap`. Tap the header
+/// to reveal the inner HTML (rendered with [PostHtml] so nested refs/links work).
+class _Spoiler extends StatefulWidget {
+  final String label;
+  final String innerHtml;
+  final void Function(int postNum)? onPostRef;
+  const _Spoiler({required this.label, required this.innerHtml, this.onPostRef});
+
+  @override
+  State<_Spoiler> createState() => _SpoilerState();
+}
+
+class _SpoilerState extends State<_Spoiler> {
+  bool _open = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      decoration: BoxDecoration(
+        color: context.mv.surfaceHigh,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: context.scheme.primary.withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: () => setState(() => _open = !_open),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _open ? Icons.visibility_off : Icons.visibility,
+                    size: 16,
+                    color: context.scheme.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    widget.label,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: context.scheme.primary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_open)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+              child: PostHtml(widget.innerHtml, onPostRef: widget.onPostRef),
+            ),
+        ],
+      ),
+    );
+  }
+}
 
 /// Circular user avatar with a fallback initial.
 class MvAvatar extends StatelessWidget {

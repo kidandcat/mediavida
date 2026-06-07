@@ -58,7 +58,7 @@ func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookSt
 // on the poll goroutine (race-free); the disk write happens in the background.
 func (bp *BubblesPoller) persistModState() {
 	data := marshalModState(bp.prevMod, bp.prevReports)
-	go writeModState(data)
+	go writeModState(data) // goroutine-ok: fire-and-forget async disk write
 }
 
 // Start begins polling bubbles.php in a background goroutine.
@@ -70,8 +70,8 @@ func (bp *BubblesPoller) Start() {
 		return
 	}
 	bp.stopCh = make(chan struct{})
-	go bp.poll()
-	go bp.dailySummaryLoop()
+	go bp.poll()              // goroutine-ok: long-lived background poller, lives for the process lifetime (stopped via stopCh)
+	go bp.dailySummaryLoop()  // goroutine-ok: long-lived background loop, lives for the process lifetime (stopped via stopCh)
 }
 
 // Stop stops the polling goroutine.
@@ -149,10 +149,11 @@ func (bp *BubblesPoller) check() {
 			var expired *ErrSessionExpired
 			if errors.As(err, &expired) || !s.Scraper.IsLoggedIn() {
 				log.Printf("[bubbles] session invalid for %s, attempting re-login", s.Scraper.Username())
-				if err := s.Scraper.Relogin(); err != nil {
-					log.Printf("[bubbles] re-login failed for %s: %v", s.Scraper.Username(), err)
+				if rerr := s.Scraper.Relogin(); rerr != nil {
+					log.Printf("[bubbles] re-login failed for %s: %v", s.Scraper.Username(), rerr)
 					// Notify via webhook that re-auth is needed
-					if _, ok := err.(*ErrGuardRequired); ok {
+					var guardErr *ErrGuardRequired
+					if errors.As(rerr, &guardErr) {
 						bp.webhooks.Send(s.Scraper.Username(), &Bubbles{Messages: -1, Notifications: -1, Favorites: -1})
 					}
 					return

@@ -55,6 +55,20 @@ class NotificationService {
       final n = msg.notification;
       if (n != null) _showLocal(n.title ?? 'Mediavida', n.body ?? '');
     });
+
+    // Tapping a push (backgrounded → resumed) or launching from one (terminated)
+    // should clear the tray so the same notification doesn't linger — most
+    // visibly on iOS, where delivered notifications stay in Notification Center.
+    final initial = await FirebaseMessaging.instance.getInitialMessage();
+    if (initial != null) await clearDelivered();
+    FirebaseMessaging.onMessageOpenedApp.listen((_) => clearDelivered());
+  }
+
+  /// Clear all delivered notifications from the tray / Notification Center and
+  /// reset the iOS app badge. On iOS [cancelAll] removes already-delivered
+  /// notifications; on Android it cancels them too.
+  Future<void> clearDelivered() async {
+    await _local.cancelAll();
   }
 
   /// Register this device for push under the given backend bearer token.

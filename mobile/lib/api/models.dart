@@ -142,6 +142,8 @@ class Post {
   final String date;
   final int time;
   final bool liked;
+  /// Number of forward-quote replies to this post (the web's "N respuestas").
+  final int replies;
 
   const Post({
     required this.num,
@@ -152,6 +154,7 @@ class Post {
     this.date = '',
     this.time = 0,
     this.liked = false,
+    this.replies = 0,
   });
 
   factory Post.fromJson(Map<String, dynamic> j) => Post(
@@ -163,6 +166,30 @@ class Post {
         date: _s(j['date']),
         time: _i(j['time']),
         liked: _b(j['liked']),
+        replies: _i(j['replies']),
+      );
+}
+
+/// A forward-quote reply to a post, returned by `GET /threads/quoted`.
+class QuotedReply {
+  final int num;
+  final String author;
+  final String avatar;
+  final String bodyHtml;
+  final String date;
+  const QuotedReply({
+    required this.num,
+    required this.author,
+    this.avatar = '',
+    this.bodyHtml = '',
+    this.date = '',
+  });
+  factory QuotedReply.fromJson(Map<String, dynamic> j) => QuotedReply(
+        num: _i(j['num']),
+        author: _s(j['author']),
+        avatar: _s(j['avatar']),
+        bodyHtml: _s(j['body_html']),
+        date: _s(j['date']),
       );
 }
 

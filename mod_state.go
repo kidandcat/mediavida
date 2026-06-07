@@ -15,7 +15,7 @@ type modStateOnDisk struct {
 }
 
 func modStateFile() string {
-	dir, _ := os.UserConfigDir()
+	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
 	return filepath.Join(dir, "mediavida-mcp", "mod_state.json")
 }
 
@@ -28,8 +28,8 @@ func loadModState() (map[string]map[string]*ModBubbles, map[string]map[string]ma
 		return mod, reports
 	}
 	var disk modStateOnDisk
-	if err := json.Unmarshal(data, &disk); err != nil {
-		log.Printf("[mod-state] decode failed: %v — starting fresh", err)
+	if derr := json.Unmarshal(data, &disk); derr != nil {
+		log.Printf("[mod-state] decode failed: %v — starting fresh", derr)
 		return mod, reports
 	}
 	if disk.Mod != nil {
@@ -67,7 +67,7 @@ func marshalModState(mod map[string]map[string]*ModBubbles, reports map[string]m
 			disk.Reports[clientID][slug] = keys
 		}
 	}
-	data, _ := json.Marshal(disk)
+	data, _ := json.Marshal(disk) // safe-ignore: marshaling a static struct never fails
 	return data
 }
 
@@ -75,7 +75,7 @@ func marshalModState(mod map[string]map[string]*ModBubbles, reports map[string]m
 // in a goroutine since the snapshot is already detached from the live maps.
 func writeModState(data []byte) {
 	path := modStateFile()
-	os.MkdirAll(filepath.Dir(path), 0700)
+	_ = os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		log.Printf("[mod-state] save failed: %v", err)
 	}

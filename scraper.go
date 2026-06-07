@@ -8,6 +8,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -37,6 +38,7 @@ type ForumMessage struct {
 	Time     int64  // unix seconds, 0 if unknown
 	Num      int
 	Liked    bool // true if the current user has liked this post
+	Replies  int  // number of forward-quote replies to this post (the web's "N respuestas" button)
 }
 
 // ErrGuardRequired is returned when login requires email PIN verification.
@@ -73,13 +75,13 @@ func utlsDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close() // safe-ignore: best-effort cleanup
 		return nil, err
 	}
 	tlsConn := tls.UClient(conn, &tls.Config{ServerName: host}, tls.HelloChrome_Auto)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		conn.Close()
-		return nil, err
+	if herr := tlsConn.HandshakeContext(ctx); herr != nil {
+		_ = conn.Close() // safe-ignore: best-effort cleanup
+		return nil, herr
 	}
 	return tlsConn, nil
 }
@@ -95,7 +97,7 @@ func newChromeTransport() http.RoundTripper {
 }
 
 func NewForumScraper(user, pass, clientID string) *ForumScraper {
-	jar, _ := cookiejar.New(nil)
+	jar, _ := cookiejar.New(nil) // safe-ignore: cookiejar.New(nil) never returns an error
 	return &ForumScraper{
 		client: &http.Client{
 			Jar:       jar,
@@ -180,8 +182,8 @@ func (s *ForumScraper) Login() error {
 		return err
 	}
 	// Log full response for debugging
-	body, _ := io.ReadAll(loginResp.Body)
-	loginResp.Body.Close()
+	body, _ := io.ReadAll(loginResp.Body) // safe-ignore: best-effort read; status checked below
+	_ = loginResp.Body.Close()            // safe-ignore: best-effort cleanup
 	log.Printf("Login POST: status=%d, location=%q", loginResp.StatusCode, loginResp.Header.Get("Location"))
 	if loginResp.StatusCode != 302 {
 		// Parse error from HTML if present
@@ -215,7 +217,7 @@ func (s *ForumScraper) Login() error {
 	}
 	defer resp.Body.Close()
 
-	u, _ := url.Parse("https://www.mediavida.com")
+	u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
 	cookies := s.client.Jar.Cookies(u)
 	hasSession := false
 	for _, c := range cookies {
@@ -254,7 +256,7 @@ func (s *ForumScraper) SubmitGuard(guardURL, code string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close() // safe-ignore: best-effort cleanup
 
 	log.Printf("Guard response: status=%d, url=%s", resp.StatusCode, resp.Request.URL)
 
@@ -263,9 +265,9 @@ func (s *ForumScraper) SubmitGuard(guardURL, code string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close() // safe-ignore: best-effort cleanup
 
-	u, _ := url.Parse("https://www.mediavida.com")
+	u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
 	cookies := s.client.Jar.Cookies(u)
 	hasSession := false
 	for _, c := range cookies {
@@ -286,7 +288,7 @@ func (s *ForumScraper) SubmitGuard(guardURL, code string) error {
 // sessionFile returns the path to the session cookie file.
 // If clientID is non-empty, returns a per-client session file.
 func sessionFile(clientID string) string {
-	dir, _ := os.UserConfigDir()
+	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
 	if clientID == "" {
 		return filepath.Join(dir, "mediavida-mcp", "session.json")
 	}
@@ -314,7 +316,7 @@ type savedCookie struct {
 
 // SaveSession persists cookies and credentials to disk so the user doesn't need to log in every time.
 func (s *ForumScraper) SaveSession() {
-	u, _ := url.Parse("https://www.mediavida.com")
+	u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
 	cookies := s.client.Jar.Cookies(u)
 	var saved []savedCookie
 	for _, c := range cookies {
@@ -338,8 +340,8 @@ func (s *ForumScraper) SaveSession() {
 	}
 	sess := savedSession{User: s.user, Pass: s.pass, Cookies: saved}
 	path := sessionFile(s.clientID)
-	os.MkdirAll(filepath.Dir(path), 0700)
-	data, _ := json.Marshal(sess)
+	os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
+	data, _ := json.Marshal(sess)         // safe-ignore: marshaling a static struct never fails
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		log.Printf("Failed to save session: %v", err)
 	}
@@ -363,12 +365,12 @@ func (s *ForumScraper) LoadSession() bool {
 
 	// Try new format (with credentials)
 	var sess savedSession
-	if err := json.Unmarshal(data, &sess); err == nil && len(sess.Cookies) > 0 {
+	if uerr := json.Unmarshal(data, &sess); uerr == nil && len(sess.Cookies) > 0 {
 		if sess.User != "" {
 			s.user = sess.User
 			s.pass = sess.Pass
 		}
-		u, _ := url.Parse("https://www.mediavida.com")
+		u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
 		var cookies []*http.Cookie
 		for _, sc := range sess.Cookies {
 			// Skip expired cookies
@@ -391,7 +393,7 @@ func (s *ForumScraper) LoadSession() bool {
 			log.Printf("All cookies expired for user %s", s.user)
 			return false
 		}
-		s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies)
+		s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies) // safe-ignore: jar is always *cookiejar.Jar
 		s.loggedIn = true
 		log.Printf("Session restored from disk (user: %s, %d cookies)", s.user, len(cookies))
 		return true
@@ -399,10 +401,10 @@ func (s *ForumScraper) LoadSession() bool {
 
 	// Fallback: old format (array of cookies only)
 	var saved []savedCookie
-	if err := json.Unmarshal(data, &saved); err != nil {
+	if uerr := json.Unmarshal(data, &saved); uerr != nil {
 		return false
 	}
-	u, _ := url.Parse("https://www.mediavida.com")
+	u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
 	var cookies []*http.Cookie
 	for _, sc := range saved {
 		cookies = append(cookies, &http.Cookie{
@@ -416,7 +418,7 @@ func (s *ForumScraper) LoadSession() bool {
 			HttpOnly: sc.HttpOnly,
 		})
 	}
-	s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies)
+	s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies) // safe-ignore: jar is always *cookiejar.Jar
 	s.loggedIn = true
 	log.Println("Session restored from disk (legacy format)")
 	return true
@@ -424,10 +426,10 @@ func (s *ForumScraper) LoadSession() bool {
 
 // ClearSession removes the saved session file.
 func (s *ForumScraper) ClearSession() {
-	os.Remove(sessionFile(s.clientID))
+	_ = os.Remove(sessionFile(s.clientID)) // safe-ignore: best-effort cleanup
 	s.loggedIn = false
 	// Reset cookie jar so stale cookies don't interfere with re-login
-	jar, _ := cookiejar.New(nil)
+	jar, _ := cookiejar.New(nil) // safe-ignore: cookiejar.New(nil) never returns an error
 	s.client.Jar = jar
 }
 
@@ -512,7 +514,7 @@ func (s *ForumScraper) LikeMessage(postNum int) error {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body) // safe-ignore: best-effort read; status checked below
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("mola returned status %d: %s", resp.StatusCode, string(body))
 	}
@@ -549,7 +551,7 @@ func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
 		return "", fmt.Errorf("post source request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body) // safe-ignore: best-effort read; status checked below
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("post source returned %d", resp.StatusCode)
 	}
@@ -586,7 +588,7 @@ func (s *ForumScraper) GetQuotedPost(postNum int) (author, bodyHTML string, err 
 		return "", "", fmt.Errorf("quote request failed: %w", e)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body) // safe-ignore: best-effort read; status checked below
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("quote returned %d", resp.StatusCode)
 	}
@@ -596,7 +598,7 @@ func (s *ForumScraper) GetQuotedPost(postNum int) (author, bodyHTML string, err 
 		Min    string `json:"min"`
 		Full   string `json:"full"`
 	}
-	if e := json.Unmarshal(body, &res); e != nil {
+	if derr := json.Unmarshal(body, &res); derr != nil {
 		return "", strings.TrimSpace(string(body)), nil
 	}
 	text := res.Full
@@ -604,6 +606,108 @@ func (s *ForumScraper) GetQuotedPost(postNum int) (author, bodyHTML string, err 
 		text = res.Min
 	}
 	return "", text, nil
+}
+
+// QuotedReply is one forward-quote reply to a post (mediavida's post_quoted.php).
+type QuotedReply struct {
+	Num      int
+	Author   string
+	Avatar   string // absolute avatar URL
+	BodyHTML string // post body HTML, URLs absolutized
+	Date     string // human date label (fecha2, text-only)
+}
+
+// GetPostQuoted fetches the posts that quote/reply to postNum in the current
+// thread (the web's "N respuestas" expander -> post_quoted.php). Read the thread first.
+func (s *ForumScraper) GetPostQuoted(postNum int) ([]QuotedReply, error) {
+	if !s.loggedIn {
+		return nil, fmt.Errorf("not logged in")
+	}
+	if s.threadID == "" || s.csrfToken == "" {
+		return nil, fmt.Errorf("no thread loaded; read the thread first")
+	}
+	data := url.Values{
+		"num":   {strconv.Itoa(postNum)},
+		"tid":   {s.threadID},
+		"token": {s.csrfToken},
+	}
+	req, e := http.NewRequest("POST", "https://www.mediavida.com/foro/post_quoted.php", strings.NewReader(data.Encode()))
+	if e != nil {
+		return nil, e
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Origin", "https://www.mediavida.com")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	resp, e := s.client.Do(req)
+	if e != nil {
+		return nil, fmt.Errorf("quoted request failed: %w", e)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body) // safe-ignore: best-effort read; status checked below
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("quoted returned %d", resp.StatusCode)
+	}
+	// post_quoted.php returns JSON {status, posts:[{num, autor:{nombre, avatar}, fecha2, text, quotes}]}.
+	// Note: num and quotes come as JSON strings, not numbers.
+	var res struct {
+		Status int `json:"status"`
+		Posts  []struct {
+			Num   string `json:"num"`
+			Autor struct {
+				Nombre string `json:"nombre"`
+				Avatar string `json:"avatar"` // an <img> HTML string
+			} `json:"autor"`
+			Fecha2 string `json:"fecha2"` // may contain HTML
+			Text   string `json:"text"`   // body HTML
+			Quotes string `json:"quotes"`
+		} `json:"posts"`
+	}
+	if derr := json.Unmarshal(body, &res); derr != nil {
+		return nil, fmt.Errorf("quoted decode failed: %w", derr)
+	}
+	replies := make([]QuotedReply, 0, len(res.Posts))
+	if res.Status == 0 {
+		return replies, nil
+	}
+	for _, p := range res.Posts {
+		// Extract the avatar src (prefer data-src then src) from the <img> HTML.
+		avatar := ""
+		if frag, err := goquery.NewDocumentFromReader(strings.NewReader(p.Autor.Avatar)); err == nil {
+			img := frag.Find("img").First()
+			avatar = absolutizeMV(img.AttrOr("data-src", img.AttrOr("src", "")))
+		}
+		// Absolutize URLs in the body HTML the same way parseMessages does.
+		bodyHTML := strings.TrimSpace(p.Text)
+		if frag, err := goquery.NewDocumentFromReader(strings.NewReader(p.Text)); err == nil {
+			frag.Find("img[data-src]").Each(func(_ int, img *goquery.Selection) {
+				if ds := img.AttrOr("data-src", ""); ds != "" {
+					img.SetAttr("src", ds)
+				}
+			})
+			frag.Find("img[src]").Each(func(_ int, img *goquery.Selection) {
+				img.SetAttr("src", absolutizeMV(img.AttrOr("src", "")))
+			})
+			frag.Find("a[href]").Each(func(_ int, a *goquery.Selection) {
+				a.SetAttr("href", absolutizeMV(a.AttrOr("href", "")))
+			})
+			if h, herr := frag.Find("body").Html(); herr == nil {
+				bodyHTML = strings.TrimSpace(h)
+			}
+		}
+		// Strip any tags from the date label.
+		date := strings.TrimSpace(p.Fecha2)
+		if frag, err := goquery.NewDocumentFromReader(strings.NewReader(p.Fecha2)); err == nil {
+			date = strings.TrimSpace(frag.Text())
+		}
+		num, _ := strconv.Atoi(p.Num) // safe-ignore: post number always numeric; 0 fallback is harmless
+		replies = append(replies, QuotedReply{
+			Num: num, Author: p.Autor.Nombre, Avatar: avatar, BodyHTML: bodyHTML, Date: date,
+		})
+	}
+	return replies, nil
 }
 
 // EditMessage edits an existing post in the last-read thread (poster.php with a
@@ -636,7 +740,7 @@ func (s *ForumScraper) EditMessage(postNum int, text string) error {
 		return fmt.Errorf("edit request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body) // safe-ignore: best-effort read; status checked below
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("edit returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body[:min(200, len(body))])))
 	}
@@ -644,7 +748,7 @@ func (s *ForumScraper) EditMessage(postNum int, text string) error {
 	var res struct {
 		Status int `json:"status"`
 	}
-	if err := json.Unmarshal(body, &res); err == nil && res.Status != 1 {
+	if uerr := json.Unmarshal(body, &res); uerr == nil && res.Status != 1 {
 		return fmt.Errorf("edit rejected by mediavida: %s", strings.TrimSpace(string(body[:min(200, len(body))])))
 	}
 	return nil
@@ -699,7 +803,7 @@ func (s *ForumScraper) PostReply(text string, replyToNum int) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body) // safe-ignore: best-effort read; status checked below
 	log.Printf("Reply POST: status=%d (replyTo=#%d, len=%d)", resp.StatusCode, replyToNum, len(body))
 
 	// A successful post redirects (302) to the thread page
@@ -984,7 +1088,7 @@ func (s *ForumScraper) FetchMentions(username string) ([]MentionItem, error) {
 	var items []MentionItem
 	doc.Find("div.post").Each(func(i int, sel *goquery.Selection) {
 		snum := sel.AttrOr("data-num", "0")
-		num, _ := strconv.Atoi(snum)
+		num, _ := strconv.Atoi(snum) // safe-ignore: 0 fallback is the intended default
 		author := sel.AttrOr("data-autor", "")
 		threadLink := sel.Find(".post-meta h1 a").First()
 		threadTitle := strings.TrimSpace(threadLink.Text())
@@ -1120,11 +1224,11 @@ func (s *ForumScraper) FetchBubbles() (*Bubbles, error) {
 
 	// bubbles.php may return an object {"bm":0,"bn":0,"bf":0} or an array [0,0,0]
 	var b Bubbles
-	if err := json.Unmarshal(body, &b); err != nil {
+	if uerr := json.Unmarshal(body, &b); uerr != nil {
 		// Try array format [bm, bn, bf]
 		var arr []int
 		if err2 := json.Unmarshal(body, &arr); err2 != nil {
-			return nil, fmt.Errorf("bubbles decode failed: %w (body: %s)", err, string(body[:min(200, len(body))]))
+			return nil, fmt.Errorf("bubbles decode failed: %w (body: %s)", uerr, string(body[:min(200, len(body))]))
 		}
 		// Empty array [] also means not logged in
 		if len(arr) == 0 {
@@ -1342,7 +1446,7 @@ func (s *ForumScraper) RefreshSession() error {
 	if err != nil {
 		return fmt.Errorf("session refresh failed: %w", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close() // safe-ignore: best-effort cleanup
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("session refresh returned status %d", resp.StatusCode)
 	}
@@ -1379,14 +1483,15 @@ func (s *ForumScraper) SetTOTPSecret(secret string) {
 func (s *ForumScraper) Relogin() error {
 	s.ClearSession()
 	if err := s.Login(); err != nil {
-		if guardErr, ok := err.(*ErrGuardRequired); ok && s.totpSecret != "" {
-			code, err := generateTOTP(s.totpSecret)
-			if err != nil {
-				return fmt.Errorf("TOTP generation failed: %w", err)
+		var guardErr *ErrGuardRequired
+		if errors.As(err, &guardErr) && s.totpSecret != "" {
+			code, terr := generateTOTP(s.totpSecret)
+			if terr != nil {
+				return fmt.Errorf("TOTP generation failed: %w", terr)
 			}
 			log.Printf("Guard required, submitting TOTP code automatically")
-			if err := s.SubmitGuard(guardErr.GuardURL, code); err != nil {
-				return fmt.Errorf("auto guard verification failed: %w", err)
+			if gerr := s.SubmitGuard(guardErr.GuardURL, code); gerr != nil {
+				return fmt.Errorf("auto guard verification failed: %w", gerr)
 			}
 			s.SaveSession()
 			return nil
@@ -1611,7 +1716,7 @@ func (s *ForumScraper) SendPrivateMessage(conversationID, text string) error {
 		return fmt.Errorf("send message failed: %w", err)
 	}
 	defer postResp.Body.Close()
-	body, _ := io.ReadAll(postResp.Body)
+	body, _ := io.ReadAll(postResp.Body) // safe-ignore: best-effort read; status checked below
 	if postResp.StatusCode >= 400 {
 		return fmt.Errorf("send message returned %d: %s", postResp.StatusCode, strings.TrimSpace(string(body[:min(200, len(body))])))
 	}
@@ -1735,7 +1840,7 @@ func (s *ForumScraper) CreateThread(subforum, title, body string, tag int, addTo
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body) // safe-ignore: best-effort read; status checked below
 	log.Printf("CreateThread POST: status=%d, body=%s", resp.StatusCode, string(respBody[:min(500, len(respBody))]))
 
 	if resp.StatusCode != http.StatusOK {
@@ -1779,7 +1884,7 @@ func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, err
 
 	totalPages := 1
 	doc.Find(".side-pages li a").Each(func(i int, sel *goquery.Selection) {
-		if n, err := strconv.Atoi(sel.Text()); err == nil && n > totalPages {
+		if n, aerr := strconv.Atoi(sel.Text()); aerr == nil && n > totalPages {
 			totalPages = n
 		}
 	})
@@ -1833,7 +1938,7 @@ func (s *ForumScraper) parseMessages(doc *goquery.Document) []ForumMessage {
 	doc.Find(".cf.post").Each(func(i int, sel *goquery.Selection) {
 		author, _ := sel.Attr("data-autor")
 		snum, _ := sel.Attr("data-num")
-		num, _ := strconv.Atoi(snum)
+		num, _ := strconv.Atoi(snum) // safe-ignore: 0 fallback is the intended default
 
 		contents := sel.Find(".post-contents").First()
 		body := strings.TrimSpace(contents.Text())
@@ -1866,10 +1971,11 @@ func (s *ForumScraper) parseMessages(doc *goquery.Document) []ForumMessage {
 		}
 
 		liked := sel.Find("a.post-btn.masmola").AttrOr("data-undo", "false") == "true"
+		replies, _ := strconv.Atoi(sel.Find("a.btnrep").First().AttrOr("rel", "")) // safe-ignore: 0 when no reply button / unparseable
 		if body != "" || bodyHTML != "" {
 			messages = append(messages, ForumMessage{
 				Author: author, Body: body, BodyHTML: bodyHTML,
-				Avatar: avatarURL, Date: date, Time: ts, Num: num, Liked: liked,
+				Avatar: avatarURL, Date: date, Time: ts, Num: num, Liked: liked, Replies: replies,
 			})
 		}
 	})

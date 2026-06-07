@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -101,7 +102,8 @@ func (ss *SessionStore) CreateFromCredentials(clientID, user, pass string) error
 
 	err := scraper.Login()
 	if err != nil {
-		if guardErr, ok := err.(*ErrGuardRequired); ok {
+		var guardErr *ErrGuardRequired
+		if errors.As(err, &guardErr) {
 			session := &Session{
 				Scraper:  scraper,
 				Status:   "guard_required",

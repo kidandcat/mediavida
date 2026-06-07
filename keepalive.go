@@ -31,7 +31,7 @@ func (ka *SessionKeepAlive) Start() {
 		return
 	}
 	ka.stopCh = make(chan struct{})
-	go ka.loop()
+	go ka.loop() // goroutine-ok: long-lived background poller, stopped via stopCh for the process lifetime
 }
 
 func (ka *SessionKeepAlive) Stop() {

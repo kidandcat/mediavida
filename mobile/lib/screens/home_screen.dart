@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/models.dart';
+import '../core/notification_service.dart';
 import '../state/providers.dart';
 import 'favorites_screen.dart';
 import 'forum_index_screen.dart';
@@ -55,6 +56,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
     if (state == AppLifecycleState.resumed) {
       _refreshBubbles();
       ref.read(configProvider.notifier).verifySession();
+      // Returning to the foreground (e.g. after tapping a push) clears the tray.
+      NotificationService().clearDelivered();
     }
   }
 

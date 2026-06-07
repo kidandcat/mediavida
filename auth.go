@@ -33,23 +33,23 @@ type authFlow struct {
 }
 
 var (
-	authFlows   sync.Map
-	flowCleanup sync.Once
+	authFlows   sync.Map  // global-ok: process-wide in-memory auth-flow registry
+	flowCleanup sync.Once // global-ok: process-wide once guard for the expiry sweeper
 )
 
 func generateFlowID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	_, _ = rand.Read(b) // safe-ignore: crypto/rand.Read never returns an error on supported platforms
 	return hex.EncodeToString(b)
 }
 
 func createAuthFlow(clientID string) string {
 	flowCleanup.Do(func() {
-		go func() {
+		go func() { // goroutine-ok: long-lived background expiry sweeper, lives for the process lifetime
 			for {
 				time.Sleep(10 * time.Minute)
 				now := time.Now()
-				authFlows.Range(func(key, value any) bool {
+				authFlows.Range(func(key, value any) bool { // any-ok: sync.Map.Range signature requires any
 					if flow, ok := value.(*authFlow); ok {
 						if now.Sub(flow.CreatedAt) > 30*time.Minute {
 							authFlows.Delete(key)
@@ -70,7 +70,7 @@ func getAuthFlow(id string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	flow := v.(*authFlow)
+	flow := v.(*authFlow) // safe-ignore: authFlows only ever stores *authFlow values
 	if time.Since(flow.CreatedAt) > 30*time.Minute {
 		authFlows.Delete(id)
 		return "", false
@@ -84,6 +84,7 @@ func deleteAuthFlow(id string) {
 
 // --- HTML templates ---
 
+// global-ok: html template compiled once at startup
 var loginTpl = template.Must(template.New("login").Parse(`<!DOCTYPE html>
 <html><head><title>Mediavida — Login</title>
 <style>
@@ -109,6 +110,7 @@ button:hover{background:#1a4a8a}
 {{if .Success}}<p class="success">{{.Success}}</p>{{end}}
 </body></html>`))
 
+// global-ok: html template compiled once at startup
 var guardTpl = template.Must(template.New("guard").Parse(`<!DOCTYPE html>
 <html><head><title>Mediavida — Verificación</title>
 <style>
@@ -198,8 +200,8 @@ func RegisterAppLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
 					writeError(w, http.StatusUnauthorized, "sesión de verificación no encontrada; reintenta")
 					return
 				}
-				if err := sess.Scraper.SubmitGuard(guardErr.GuardURL, req.TOTP); err != nil {
-					writeError(w, http.StatusUnauthorized, "código incorrecto: "+err.Error())
+				if gerr := sess.Scraper.SubmitGuard(guardErr.GuardURL, req.TOTP); gerr != nil {
+					writeError(w, http.StatusUnauthorized, "código incorrecto: "+gerr.Error())
 					return
 				}
 				sess.Status = "authenticated"
@@ -230,7 +232,7 @@ func RegisterLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
 				http.Error(w, "invalid or expired auth flow", http.StatusBadRequest)
 				return
 			}
-			loginTpl.Execute(w, map[string]string{"FlowID": flowID})
+			_ = loginTpl.Execute(w, map[string]string{"FlowID": flowID}) // safe-ignore: best-effort response render
 
 		case http.MethodPost:
 			flowID := r.FormValue("flow_id")
@@ -245,22 +247,23 @@ func RegisterLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
 
 			err := sessions.CreateFromCredentials(clientID, user, pass)
 			if err != nil {
-				if _, ok := err.(*ErrGuardRequired); ok {
-					guardTpl.Execute(w, map[string]string{"FlowID": flowID})
+				var guardErr *ErrGuardRequired
+				if errors.As(err, &guardErr) {
+					_ = guardTpl.Execute(w, map[string]string{"FlowID": flowID}) // safe-ignore: best-effort response render
 					return
 				}
-				loginTpl.Execute(w, map[string]string{
+				_ = loginTpl.Execute(w, map[string]string{
 					"FlowID": flowID,
 					"Error":  err.Error(),
-				})
+				}) // safe-ignore: best-effort response render
 				return
 			}
 
 			deleteAuthFlow(flowID)
 			log.Printf("[auth] client %s authenticated with Mediavida", clientID)
-			loginTpl.Execute(w, map[string]string{
+			_ = loginTpl.Execute(w, map[string]string{
 				"Success": "Login correcto. La sesión está activa. Puedes cerrar esta ventana.",
-			})
+			}) // safe-ignore: best-effort response render
 
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -288,10 +291,10 @@ func RegisterLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
 		}
 
 		if err := session.Scraper.SubmitGuard(session.GuardURL, code); err != nil {
-			guardTpl.Execute(w, map[string]string{
+			_ = guardTpl.Execute(w, map[string]string{
 				"FlowID": flowID,
 				"Error":  err.Error(),
-			})
+			}) // safe-ignore: best-effort response render
 			return
 		}
 
@@ -299,8 +302,8 @@ func RegisterLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
 		session.Scraper.SaveSession()
 		deleteAuthFlow(flowID)
 		log.Printf("[auth] client %s authenticated with Mediavida (after guard)", clientID)
-		loginTpl.Execute(w, map[string]string{
+		_ = loginTpl.Execute(w, map[string]string{
 			"Success": "Login correcto. La sesión está activa. Puedes cerrar esta ventana.",
-		})
+		}) // safe-ignore: best-effort response render
 	})
 }

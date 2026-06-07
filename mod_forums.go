@@ -24,7 +24,7 @@ func NewModForumsStore() *ModForumsStore {
 }
 
 func modForumsFile() string {
-	dir, _ := os.UserConfigDir()
+	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
 	return filepath.Join(dir, "mediavida-mcp", "mod_forums.json")
 }
 
@@ -34,8 +34,8 @@ func (s *ModForumsStore) load() {
 		return
 	}
 	var m map[string][]string
-	if err := json.Unmarshal(data, &m); err != nil {
-		log.Printf("[mod-forums] decode failed: %v — starting empty", err)
+	if derr := json.Unmarshal(data, &m); derr != nil {
+		log.Printf("[mod-forums] decode failed: %v — starting empty", derr)
 		return
 	}
 	s.mu.Lock()
@@ -46,11 +46,11 @@ func (s *ModForumsStore) load() {
 
 func (s *ModForumsStore) save() {
 	s.mu.RLock()
-	data, _ := json.Marshal(s.forums)
+	data, _ := json.Marshal(s.forums) // safe-ignore: marshaling a static struct never fails
 	s.mu.RUnlock()
 
 	path := modForumsFile()
-	os.MkdirAll(filepath.Dir(path), 0700)
+	_ = os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		log.Printf("[mod-forums] save failed: %v", err)
 	}
@@ -80,7 +80,7 @@ func (s *ModForumsStore) Add(username, slug string) bool {
 	sort.Strings(list)
 	s.forums[username] = list
 	s.mu.Unlock()
-	go s.save()
+	go s.save() // goroutine-ok: fire-and-forget async save
 	return true
 }
 
@@ -106,7 +106,7 @@ func (s *ModForumsStore) Remove(username, slug string) bool {
 	}
 	s.mu.Unlock()
 	if changed {
-		go s.save()
+		go s.save() // goroutine-ok: fire-and-forget async save
 	}
 	return changed
 }

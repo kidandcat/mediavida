@@ -25,17 +25,17 @@ func NewWebhookStore() *WebhookStore {
 }
 
 func webhookFile() string {
-	dir, _ := os.UserConfigDir()
+	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
 	return filepath.Join(dir, "mediavida-mcp", "webhooks.json")
 }
 
 func (ws *WebhookStore) save() {
 	ws.mu.RLock()
-	data, _ := json.Marshal(ws.webhooks)
+	data, _ := json.Marshal(ws.webhooks) // safe-ignore: marshaling a static struct never fails
 	ws.mu.RUnlock()
 
 	path := webhookFile()
-	os.MkdirAll(filepath.Dir(path), 0700)
+	_ = os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		log.Printf("[webhook] failed to save: %v", err)
 	}
@@ -47,7 +47,7 @@ func (ws *WebhookStore) load() {
 		return
 	}
 	var m map[string]string
-	if err := json.Unmarshal(data, &m); err != nil {
+	if uerr := json.Unmarshal(data, &m); uerr != nil {
 		return
 	}
 	ws.webhooks = m
@@ -59,7 +59,7 @@ func (ws *WebhookStore) Set(username, url string) {
 	ws.mu.Lock()
 	ws.webhooks[username] = url
 	ws.mu.Unlock()
-	go ws.save()
+	go ws.save() // goroutine-ok: fire-and-forget async save
 }
 
 // Remove deletes the webhook for a user.
@@ -67,7 +67,7 @@ func (ws *WebhookStore) Remove(username string) {
 	ws.mu.Lock()
 	delete(ws.webhooks, username)
 	ws.mu.Unlock()
-	go ws.save()
+	go ws.save() // goroutine-ok: fire-and-forget async save
 }
 
 // Get returns the webhook URL for a user, or empty string if none.
@@ -98,7 +98,7 @@ func (ws *WebhookStore) Send(username string, bubbles *Bubbles) {
 		Notifications: bubbles.Notifications,
 		Favorites:     bubbles.Favorites,
 	}
-	data, _ := json.Marshal(payload)
+	data, _ := json.Marshal(payload) // safe-ignore: marshaling a static struct never fails
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(data))
@@ -106,7 +106,7 @@ func (ws *WebhookStore) Send(username string, bubbles *Bubbles) {
 		log.Printf("[webhook] POST to %s failed: %v", url, err)
 		return
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close() // safe-ignore: best-effort cleanup
 
 	if resp.StatusCode >= 400 {
 		log.Printf("[webhook] POST to %s returned %d", url, resp.StatusCode)

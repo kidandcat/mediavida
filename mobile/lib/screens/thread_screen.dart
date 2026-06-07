@@ -409,6 +409,10 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
         itemBuilder: (c, i) {
           final post = page.messages[i];
           return _PostCard(
+            // Key by post num so per-card expansion state (refs / replies) stays
+            // bound to its post and doesn't bleed across posts when the list
+            // rebuilds (e.g. on page change).
+            key: ValueKey(post.num),
             post: post,
             liked: _isLiked(post),
             mine: _isMine(post),
@@ -418,6 +422,8 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
             onQuote: () => _quote(post),
             onEdit: () => _startEdit(post),
             fetchRef: _fetchRef,
+            fetchReplies: (postNum) async =>
+                await ref.read(apiProvider)?.postQuoted(postNum) ?? const <QuotedReply>[],
           );
         },
       ),
@@ -555,7 +561,9 @@ class _PostCard extends StatefulWidget {
   final VoidCallback onQuote;
   final VoidCallback onEdit;
   final Future<RefPost?> Function(int postNum) fetchRef;
+  final Future<List<QuotedReply>> Function(int postNum) fetchReplies;
   const _PostCard({
+    super.key,
     required this.post,
     required this.liked,
     required this.mine,
@@ -565,6 +573,7 @@ class _PostCard extends StatefulWidget {
     required this.onQuote,
     required this.onEdit,
     required this.fetchRef,
+    required this.fetchReplies,
   });
 
   @override
@@ -575,6 +584,41 @@ class _PostCardState extends State<_PostCard> {
   // Inline-expanded references: num -> content (null while loading).
   final Map<int, RefPost?> _refs = {};
   final Set<int> _loading = {};
+
+  // Inline "N respuestas" expansion (forward-quote replies to this post).
+  List<QuotedReply>? _replies;
+  bool _loadingReplies = false;
+  bool _repliesOpen = false;
+
+  Future<void> _toggleReplies() async {
+    if (_repliesOpen) {
+      setState(() => _repliesOpen = false); // collapse, keep cached replies
+      return;
+    }
+    if (_replies != null) {
+      setState(() => _repliesOpen = true); // re-open without refetching
+      return;
+    }
+    setState(() {
+      _repliesOpen = true;
+      _loadingReplies = true;
+    });
+    try {
+      final replies = await widget.fetchReplies(widget.post.num);
+      if (!mounted) return;
+      setState(() {
+        _loadingReplies = false;
+        _replies = replies;
+      });
+    } catch (_) {
+      // Don't leave the spinner stuck on; collapse so the user can retry.
+      if (!mounted) return;
+      setState(() {
+        _loadingReplies = false;
+        _repliesOpen = false;
+      });
+    }
+  }
 
   Future<void> _toggleRef(int num) async {
     if (_refs.containsKey(num)) {
@@ -644,6 +688,40 @@ class _PostCardState extends State<_PostCard> {
                 onClose: () => _toggleRef(num),
                 onRefTap: _toggleRef,
               ),
+            // "N respuestas": forward-quote replies expanded inline, like the web.
+            if (post.replies > 0) ...[
+              const SizedBox(height: 6),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _loadingReplies ? null : _toggleReplies,
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 32),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    foregroundColor: context.scheme.primary,
+                  ),
+                  icon: Icon(
+                    _repliesOpen ? Icons.expand_less : Icons.expand_more,
+                    size: 18,
+                  ),
+                  label: Text(
+                    '${post.replies} ${post.replies == 1 ? "respuesta" : "respuestas"}',
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+              if (_repliesOpen)
+                if (_loadingReplies)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: SizedBox(
+                        height: 16, width: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                  )
+                else
+                  for (final r in _replies ?? const <QuotedReply>[])
+                    _ReplyBox(reply: r, onRefTap: _toggleRef),
+            ],
             const SizedBox(height: 6),
             Row(
               children: [
@@ -748,6 +826,48 @@ class _RefBox extends StatelessWidget {
             PostHtml(content!.bodyHtml!, onPostRef: onRefTap)
           else
             Text(content?.bodyText ?? '', style: const TextStyle(fontSize: 14, height: 1.4)),
+        ],
+      ),
+    );
+  }
+}
+
+/// A forward-quote reply ("N respuestas") expanded inline below a post, styled
+/// like [_RefBox]. Renders the reply's HTML so nested spoilers/links work.
+class _ReplyBox extends StatelessWidget {
+  final QuotedReply reply;
+  final void Function(int) onRefTap;
+  const _ReplyBox({required this.reply, required this.onRefTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.fromLTRB(10, 6, 6, 8),
+      decoration: BoxDecoration(
+        color: context.mv.surfaceHigh.withValues(alpha: 0.5),
+        border: Border(left: BorderSide(color: context.scheme.primary, width: 3)),
+        borderRadius: const BorderRadius.only(
+          topRight: Radius.circular(8),
+          bottomRight: Radius.circular(8),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            reply.author.isNotEmpty ? '#${reply.num} · ${reply.author}' : '#${reply.num}',
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w700,
+              color: context.scheme.primary,
+            ),
+          ),
+          const SizedBox(height: 4),
+          if (reply.bodyHtml.trim().isNotEmpty)
+            PostHtml(reply.bodyHtml, onPostRef: onRefTap)
+          else
+            const Text('(sin contenido)', style: TextStyle(fontSize: 14, height: 1.4)),
         ],
       ),
     );

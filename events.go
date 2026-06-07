@@ -46,7 +46,7 @@ func (h *EventHub) subscribe(clientID string) (chan []byte, func()) {
 
 // Publish sends a serialized event to every subscriber of clientID. Slow consumers
 // are dropped silently so a stuck client never blocks the poller.
-func (h *EventHub) Publish(clientID, event string, payload any) {
+func (h *EventHub) Publish(clientID, event string, payload any) { // any-ok: arbitrary event payload marshaled to JSON
 	data, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("[events] marshal failed for client %s: %v", clientID, err)

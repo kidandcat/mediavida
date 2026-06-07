@@ -94,4 +94,31 @@ extension MvNav on BuildContext {
   void openConversation(String id, {String title = ''}) =>
       push('/conversation/$id', extra: {'title': title});
   void openUser(String username) => push('/user/$username');
+
+  /// Opens a thread from a full Mediavida URL like
+  /// `https://www.mediavida.com/foro/<sub>/<slug>-<tid>/<PAGE>#<POSTNUM>` —
+  /// the `/<PAGE>` segment and the `#<POSTNUM>` fragment are both optional.
+  /// Parses out the page and the target post so the thread scrolls to it, like
+  /// Favorites does. If the URL isn't a thread (e.g. a `/id/username` profile
+  /// mention) it just opens it verbatim.
+  Future<void> openThreadFromUrl(String url, {String title = ''}) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.path.contains('/foro/')) {
+      return openThread(url, title: title);
+    }
+    // Post number from the fragment (#NNNN), 0 if absent/non-numeric.
+    final postNum = int.tryParse(uri.fragment) ?? 0;
+    // If the last path segment is purely numeric, it's the page — strip it.
+    final segments = List<String>.from(uri.pathSegments);
+    var page = 0;
+    if (segments.isNotEmpty && int.tryParse(segments.last) != null) {
+      page = int.parse(segments.removeLast());
+    }
+    final base = Uri(
+      scheme: uri.scheme,
+      host: uri.host,
+      pathSegments: segments,
+    ).toString();
+    return openThread(base, title: title, page: page, scrollToPost: postNum);
+  }
 }

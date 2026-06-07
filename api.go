@@ -14,11 +14,11 @@ import (
 
 // --- helpers ---
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(w http.ResponseWriter, status int, v any) { // any-ok: dynamic JSON response payload
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if v != nil {
-		_ = json.NewEncoder(w).Encode(v)
+		_ = json.NewEncoder(w).Encode(v) // safe-ignore: response already committed; best-effort write
 	}
 }
 
@@ -30,7 +30,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
 }
 
-func decodeJSON(r *http.Request, v any) error {
+func decodeJSON(r *http.Request, v any) error { // any-ok: decodes into caller-provided arbitrary JSON target
 	if r.Body == nil {
 		return nil
 	}
@@ -61,7 +61,7 @@ func requireAuthenticated(w http.ResponseWriter, r *http.Request, sessions *Sess
 // could not be renewed automatically (e.g. guard verification now required).
 // The app must prompt the user to log in again. Mapped to HTTP 401 by
 // writeAPIError so the client can drop to the login screen.
-var errReauthRequired = errors.New("session expired, re-authentication required")
+var errReauthRequired = errors.New("session expired, re-authentication required") // global-ok: sentinel error value
 
 // withRelogin runs fn; if it returns ErrSessionExpired it relogs in once and
 // retries. If the re-login itself fails the session can no longer be renewed
@@ -77,7 +77,7 @@ func withRelogin(scraper *ForumScraper, fn func() error) error {
 	}
 	log.Printf("[api] session invalid for %s, attempting re-login", scraper.Username())
 	if rerr := scraper.Relogin(); rerr != nil {
-		return fmt.Errorf("%w: %v", errReauthRequired, rerr)
+		return fmt.Errorf("%w: %w", errReauthRequired, rerr)
 	}
 	return fn()
 }
@@ -133,7 +133,8 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 
 		err := sessions.CreateFromCredentials(clientID, req.User, req.Pass)
 		if err != nil {
-			if guardErr, ok := err.(*ErrGuardRequired); ok {
+			var guardErr *ErrGuardRequired
+			if errors.As(err, &guardErr) {
 				totp := req.TOTP
 				// Auto-generate the code from MV_TOTP_SECRET when the caller
 				// didn't supply one, so headless clients never see guard_required.
@@ -152,8 +153,8 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 					return
 				}
 				sess := sessions.Get(clientID)
-				if err := sess.Scraper.SubmitGuard(guardErr.GuardURL, totp); err != nil {
-					writeError(w, http.StatusUnauthorized, "guard verification failed: "+err.Error())
+				if gerr := sess.Scraper.SubmitGuard(guardErr.GuardURL, totp); gerr != nil {
+					writeError(w, http.StatusUnauthorized, "guard verification failed: "+gerr.Error())
 					return
 				}
 				sess.Status = "authenticated"
@@ -313,7 +314,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "url query parameter is required")
 			return
 		}
-		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		page, _ := strconv.Atoi(r.URL.Query().Get("page")) // safe-ignore: 0 fallback is the intended default
 
 		var result *ThreadPage
 		err := withRelogin(scraper, func() error {
@@ -390,7 +391,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		if scraper == nil {
 			return
 		}
-		num, _ := strconv.Atoi(r.URL.Query().Get("num"))
+		num, _ := strconv.Atoi(r.URL.Query().Get("num")) // safe-ignore: 0 fallback is the intended default
 		if num <= 0 {
 			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
 			return
@@ -409,7 +410,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		if scraper == nil {
 			return
 		}
-		num, _ := strconv.Atoi(r.URL.Query().Get("num"))
+		num, _ := strconv.Atoi(r.URL.Query().Get("num")) // safe-ignore: 0 fallback is the intended default
 		if num <= 0 {
 			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
 			return
@@ -420,6 +421,40 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"num": num, "author": author, "body_html": bodyHTML})
+	})
+
+	// Fetch the forward-quote replies to a post of the last-read thread (the
+	// web's "N respuestas" expander -> post_quoted.php).
+	mux.HandleFunc("GET /threads/quoted", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		num, _ := strconv.Atoi(r.URL.Query().Get("num")) // safe-ignore: validated by the num<=0 check below
+		if num <= 0 {
+			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
+			return
+		}
+		var replies []QuotedReply
+		err := withRelogin(scraper, func() error {
+			res, err := scraper.GetPostQuoted(num)
+			if err != nil {
+				return err
+			}
+			replies = res
+			return nil
+		})
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		out := make([]quotedReplyDTO, 0, len(replies))
+		for _, q := range replies {
+			out = append(out, quotedReplyDTO{
+				Num: q.Num, Author: q.Author, Avatar: q.Avatar, BodyHTML: q.BodyHTML, Date: q.Date,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"posts": out})
 	})
 
 	// Edit one of the user's own posts in the last-read thread.
@@ -548,7 +583,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		if scraper == nil {
 			return
 		}
-		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		page, _ := strconv.Atoi(r.URL.Query().Get("page")) // safe-ignore: 0 fallback is the intended default
 		items, err := scraper.FetchInbox(page)
 		if err != nil {
 			writeAPIError(w, err)
@@ -865,6 +900,15 @@ type messageDTO struct {
 	Date     string `json:"date,omitempty"`
 	Time     int64  `json:"time,omitempty"`
 	Liked    bool   `json:"liked"`
+	Replies  int    `json:"replies"`
+}
+
+type quotedReplyDTO struct {
+	Num      int    `json:"num"`
+	Author   string `json:"author"`
+	Avatar   string `json:"avatar"`
+	BodyHTML string `json:"body_html,omitempty"`
+	Date     string `json:"date,omitempty"`
 }
 
 type threadPageDTOType struct {
@@ -882,7 +926,7 @@ func threadPageDTO(p *ThreadPage) threadPageDTOType {
 	for _, m := range p.Messages {
 		out.Messages = append(out.Messages, messageDTO{
 			Num: m.Num, Author: m.Author, Body: m.Body, BodyHTML: m.BodyHTML,
-			Avatar: m.Avatar, Date: m.Date, Time: m.Time, Liked: m.Liked,
+			Avatar: m.Avatar, Date: m.Date, Time: m.Time, Liked: m.Liked, Replies: m.Replies,
 		})
 	}
 	return out

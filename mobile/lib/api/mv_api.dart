@@ -185,6 +185,15 @@ class MvApi {
     return d['body_html']?.toString() ?? '';
   }
 
+  /// Fetch the forward-quote replies to a post in the last-read thread (the
+  /// web's "N respuestas"). Read the thread first — same constraint as [quotedPost].
+  Future<List<QuotedReply>> postQuoted(int postNum) async {
+    final d = _obj(await _dio.get('/threads/quoted', queryParameters: {'num': postNum}));
+    return ((d['posts'] as List?) ?? [])
+        .map((e) => QuotedReply.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
   /// Edit one of the user's own posts in the last-read thread.
   Future<void> editPost(int postNum, String text) async {
     final r = await _dio.post('/threads/edit', data: {'post_num': postNum, 'text': text});

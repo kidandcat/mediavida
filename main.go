@@ -83,41 +83,44 @@ func main() {
 		log.Printf("Loaded %d API token(s)", len(apiTokens))
 	}
 
-	sessions := NewSessionStore()
-	webhooks := NewWebhookStore()
-	modForums := NewModForumsStore()
-	hub := NewEventHub()
-
-	// Colmena: durable Raft-replicated store for HA (PLAN_SCALE Phase 2). Returns
-	// nil unless running in a Fly cluster, in which case the app keeps its local
-	// JSON persistence — so this is inert until the multi-node deploy is enabled.
+	// Colmena: durable Raft-replicated store. This is the ONLY persistence layer
+	// (no JSON-on-volume fallback, no enable gate). StartColmena never returns nil
+	// — in a Fly cluster it forms/joins Raft, otherwise it runs a single local
+	// bootstrap node for dev. All stores below are backed by it.
 	colmenaStore := StartColmena()
 
-	// Restore MV sessions from disk for all known API tokens. If no session is
-	// on disk (e.g. a fresh deploy), fall back to a headless auto-login using
+	sessions := NewSessionStore(colmenaStore)
+	webhooks := NewWebhookStore(colmenaStore)
+	modForums := NewModForumsStore(colmenaStore)
+	hub := NewEventHub()
+
+	// Rehydrate every durable session from Colmena (per-device app-login tokens
+	// included, not just the configured API tokens), so logins survive restarts
+	// and redeploys. This replaces the old per-token JSON-on-disk restore loop.
+	if n := sessions.RestoreAll(); n > 0 {
+		log.Printf("Restored %d session(s) from Colmena", n)
+	}
+
+	// For any configured API token that still has no live session (e.g. a fresh
+	// cluster with an empty Raft log), fall back to a headless auto-login using
 	// MV_USERNAME/MV_PASSWORD (+ MV_TOTP_SECRET for guard) so the server is
-	// authenticated without any manual step.
+	// authenticated without any manual step. RestoreSession re-checks Colmena per
+	// token in case it wasn't picked up above.
 	envUser, envPass := os.Getenv("MV_USERNAME"), os.Getenv("MV_PASSWORD")
 	for token := range apiTokens {
 		short := token[:min(16, len(token))]
-		if sessions.RestoreFromDisk(token) {
+		if sessions.Get(token) != nil || sessions.RestoreSession(token) {
 			log.Printf("MV session restored for client %s...", short)
 			continue
 		}
 		if envUser != "" && envPass != "" {
-			log.Printf("No session on disk for client %s..., attempting headless auto-login", short)
+			log.Printf("No stored session for client %s..., attempting headless auto-login", short)
 			if err := sessions.AutoLogin(token, envUser, envPass); err != nil {
 				log.Printf("Auto-login failed for client %s...: %v", short, err)
 			} else {
 				log.Printf("Auto-login successful for client %s...", short)
 			}
 		}
-	}
-
-	// Restore per-device app-login sessions persisted on disk (the volume), so
-	// users stay logged in across restarts and redeploys.
-	if n := sessions.RestoreAllFromDisk(); n > 0 {
-		log.Printf("Restored %d per-device session(s) from disk", n)
 	}
 
 	var baseURL string
@@ -140,12 +143,12 @@ func main() {
 
 	// FCM push (nil if FCM_SA_JSON/FCM_PROJECT_ID unset). Per-device tokens are
 	// registered via POST /push/register.
-	fcmTokens := NewFCMTokenStore()
+	fcmTokens := NewFCMTokenStore(colmenaStore)
 	fcmSender := NewFCMSender(fcmTokens)
 
 	// Start bubbles poller for SSE/webhook push notifications. Mod-forum
 	// subscriptions are per-user and configured via /mod/forums.
-	poller := NewBubblesPoller(hub, sessions, webhooks, telegramBot, ntfyPub, fcmSender, modForums)
+	poller := NewBubblesPoller(colmenaStore, hub, sessions, webhooks, telegramBot, ntfyPub, fcmSender, modForums)
 	poller.Start()
 
 	// Start session keepalive to prevent cookies from expiring during idle periods
@@ -168,11 +171,11 @@ func main() {
 	apiHandler := APITokenMiddleware(apiTokens, sessions, limiter.Middleware(apiMux))
 
 	root := http.NewServeMux()
-	// Health check for Fly's rolling deploy (keeps Raft quorum). 200 unless a
-	// Colmena node is up but not yet caught up. Single-node (colmenaStore nil)
-	// always reports healthy.
+	// Health check for Fly's rolling deploy (keeps Raft quorum). 200 once this
+	// node is caught up; 503 while a cluster node is still joining. Local dev mode
+	// is always healthy as soon as the bootstrap node is up.
 	root.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if colmenaStore == nil || colmenaStore.Healthy() {
+		if colmenaStore.Healthy() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok")) // safe-ignore: best-effort health body
 			return
@@ -224,11 +227,9 @@ func main() {
 		log.Printf("graceful shutdown timed out: %v", err)
 	}
 	// Leave the Raft cluster last (transfers leadership) so a rolling deploy
-	// keeps quorum. No-op when Colmena is disabled.
-	if colmenaStore != nil {
-		leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 8*time.Second)
-		colmenaStore.Leave(leaveCtx)
-		leaveCancel()
-	}
+	// keeps quorum. In local dev mode this just closes the node.
+	leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	colmenaStore.Leave(leaveCtx)
+	leaveCancel()
 	log.Println("shutdown complete")
 }

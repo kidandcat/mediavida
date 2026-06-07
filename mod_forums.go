@@ -1,59 +1,43 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 )
 
 // ModForumsStore tracks which subforums each MV user wants to monitor for mod
 // alerts. Each entry is per mv_username so the same setup auto-routes via the
-// existing per-username Telegram chat registry.
+// existing per-username Telegram chat registry. Subscriptions are persisted in
+// Colmena (cs.AddModForum/RemoveModForum/GetModForums); the in-memory map is a
+// write-through cache hydrated from Colmena at startup.
 type ModForumsStore struct {
+	cs     *ColmenaStore
 	mu     sync.RWMutex
 	forums map[string][]string // mv_username → slug list (sorted, deduped)
 }
 
-func NewModForumsStore() *ModForumsStore {
-	s := &ModForumsStore{forums: make(map[string][]string)}
+func NewModForumsStore(cs *ColmenaStore) *ModForumsStore {
+	s := &ModForumsStore{cs: cs, forums: make(map[string][]string)}
 	s.load()
 	return s
 }
 
-func modForumsFile() string {
-	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
-	return filepath.Join(dir, "mediavida-mcp", "mod_forums.json")
-}
-
 func (s *ModForumsStore) load() {
-	data, err := os.ReadFile(modForumsFile())
+	all, err := s.cs.AllModForums()
 	if err != nil {
-		return
-	}
-	var m map[string][]string
-	if derr := json.Unmarshal(data, &m); derr != nil {
-		log.Printf("[mod-forums] decode failed: %v — starting empty", derr)
+		log.Printf("[mod-forums] load failed: %v — starting empty", err)
 		return
 	}
 	s.mu.Lock()
-	s.forums = m
-	s.mu.Unlock()
-	log.Printf("[mod-forums] restored config for %d user(s) from disk", len(m))
-}
-
-func (s *ModForumsStore) save() {
-	s.mu.RLock()
-	data, _ := json.Marshal(s.forums) // safe-ignore: marshaling a static struct never fails
-	s.mu.RUnlock()
-
-	path := modForumsFile()
-	_ = os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Printf("[mod-forums] save failed: %v", err)
+	for username, slugs := range all {
+		list := make([]string, len(slugs))
+		copy(list, slugs)
+		sort.Strings(list)
+		s.forums[username] = list
 	}
+	s.mu.Unlock()
+	log.Printf("[mod-forums] restored config for %d user(s) from colmena", len(all))
 }
 
 // Get returns a copy of the slug list for a user.
@@ -80,7 +64,9 @@ func (s *ModForumsStore) Add(username, slug string) bool {
 	sort.Strings(list)
 	s.forums[username] = list
 	s.mu.Unlock()
-	go s.save() // goroutine-ok: fire-and-forget async save
+	if err := s.cs.AddModForum(username, slug); err != nil {
+		log.Printf("[mod-forums] persist add %s/%s failed: %v", username, slug, err)
+	}
 	return true
 }
 
@@ -106,7 +92,9 @@ func (s *ModForumsStore) Remove(username, slug string) bool {
 	}
 	s.mu.Unlock()
 	if changed {
-		go s.save() // goroutine-ok: fire-and-forget async save
+		if err := s.cs.RemoveModForum(username, slug); err != nil {
+			log.Printf("[mod-forums] persist remove %s/%s failed: %v", username, slug, err)
+		}
 	}
 	return changed
 }

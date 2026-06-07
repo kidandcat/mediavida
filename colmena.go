@@ -24,51 +24,92 @@ import (
 // NOT replicate — only a materially-changed auth cookie set (re-login / guard
 // resolution) is written here, debounced by the caller.
 //
-// When Colmena is not active (local dev, or a single-machine deploy without the
-// Fly environment) StartColmena returns nil and the app keeps its existing
-// JSON-on-volume persistence — so this integration is inert until enabled.
+// Colmena is the ONLY persistence — there is no JSON-on-volume fallback and no
+// enable gate. In a Fly environment (FLY_APP_NAME set) the node forms / joins a
+// Raft cluster; otherwise it runs as a single bootstrap node against a local
+// data dir for dev. Either way the *colmena.Node is the live SQL handle.
 type ColmenaStore struct {
-	cluster *fly.Cluster
+	node    *colmena.Node // underlying Colmena node — present in both modes
+	cluster *fly.Cluster  // non-nil only in Fly cluster mode
 	db      *sql.DB
 }
 
-// StartColmena boots a Colmena node from the Fly machine environment and forms /
-// joins the Raft cluster. It is gated: with no Fly env (FLY_APP_NAME unset) or
-// COLMENA_DISABLED=1 it returns (nil, nil) and the caller falls back to the
-// existing single-node persistence. Returns the store, or nil when disabled.
+// StartColmena boots the durable store. It NEVER returns nil and has no enable
+// gate: Colmena is the only persistence layer.
+//
+//   - Fly cluster mode (FLY_APP_NAME set): builds a Config from the Fly machine
+//     env, pins DataDir=/data, RaftPort=9000, VoterQuorum=3, and forms / joins
+//     the Raft cluster via fly.Start.
+//   - Local dev mode (no Fly env): a single bootstrap node bound to localhost
+//     against COLMENA_DATA_DIR (default ./colmena-data).
+//
+// On any hard start error it log.Fatals — this is dev, fail loud, no fallback.
 func StartColmena() *ColmenaStore {
-	// Explicit opt-in: Colmena only forms a cluster when COLMENA_ENABLED=1. This
-	// keeps the current single-machine prod inert (it has the Fly env but not the
-	// flag) until the multi-node deploy is deliberately switched on.
-	if os.Getenv("COLMENA_ENABLED") != "1" {
-		log.Printf("[colmena] disabled (set COLMENA_ENABLED=1 to form a cluster) — using local JSON persistence")
-		return nil
+	if os.Getenv("FLY_APP_NAME") != "" {
+		return startColmenaCluster()
 	}
+	return startColmenaLocal()
+}
 
+// startColmenaCluster forms / joins the Raft cluster from the Fly env.
+func startColmenaCluster() *ColmenaStore {
 	cfg, err := fly.FromEnv()
 	if err != nil {
-		log.Printf("[colmena] fly.FromEnv failed, staying single-node: %v", err)
-		return nil
+		log.Fatalf("[colmena] fly.FromEnv: %v", err)
 	}
-	cfg.DataDir = envOr("COLMENA_DATA_DIR", "/data")
+	cfg.DataDir = "/data"
 	cfg.RaftPort = 9000
 	cfg.VoterQuorum = 3
 
 	cluster, err := fly.Start(cfg)
 	if err != nil {
-		log.Printf("[colmena] cluster start failed, staying single-node: %v", err)
-		return nil
+		log.Fatalf("[colmena] cluster start: %v", err)
 	}
 
 	// Weak consistency on the request path (always fresh from the leader, ~tiny
 	// staleness window); the few durable writes go through Raft regardless.
 	db := cluster.Node.OpenDB("mv", colmena.ConsistencyWeak)
-	cs := &ColmenaStore{cluster: cluster, db: db}
+	cs := &ColmenaStore{node: cluster.Node, cluster: cluster, db: db}
+	// A write (CREATE TABLE) needs a leader; wait for the election to settle.
+	if lerr := cluster.Node.WaitForLeader(30 * time.Second); lerr != nil {
+		log.Fatalf("[colmena] no leader elected: %v", lerr)
+	}
 	if merr := cs.migrate(); merr != nil {
-		log.Printf("[colmena] schema migrate failed: %v", merr)
+		log.Fatalf("[colmena] schema migrate: %v", merr)
 	}
 	log.Printf("[colmena] node %s up in region %s (Raft on :%d)", cfg.NodeID, cfg.Region, cfg.RaftPort)
 	return cs
+}
+
+// startColmenaLocal brings up a single-node bootstrap cluster for dev.
+func startColmenaLocal() *ColmenaStore {
+	node, err := colmena.New(colmena.Config{
+		NodeID:    "local",
+		DataDir:   envOr("COLMENA_DATA_DIR", "./colmena-data"),
+		Bind:      "127.0.0.1:9000",
+		Bootstrap: true,
+	})
+	if err != nil {
+		log.Fatalf("[colmena] local node start: %v", err)
+	}
+
+	db := node.OpenDB("mv", colmena.ConsistencyWeak)
+	cs := &ColmenaStore{node: node, db: db}
+	// A write (CREATE TABLE) needs a leader; wait for the bootstrap election.
+	if lerr := node.WaitForLeader(30 * time.Second); lerr != nil {
+		log.Fatalf("[colmena] no leader elected: %v", lerr)
+	}
+	if merr := cs.migrate(); merr != nil {
+		log.Fatalf("[colmena] schema migrate: %v", merr)
+	}
+	log.Printf("[colmena] local node up (Raft on 127.0.0.1:9000, data %q)", envOr("COLMENA_DATA_DIR", "./colmena-data"))
+	return cs
+}
+
+// Node exposes the underlying Colmena node for the jobs subsystem (which opens
+// its own DB / registers handlers on the same Raft log).
+func (cs *ColmenaStore) Node() *colmena.Node {
+	return cs.node
 }
 
 func (cs *ColmenaStore) migrate() error {
@@ -103,20 +144,36 @@ func (cs *ColmenaStore) migrate() error {
 	return nil
 }
 
-// Healthy reports whether this node has joined the cluster and caught up — wired
-// into fly.toml's health check so a rolling deploy keeps quorum.
+// Healthy reports whether this node is ready to serve — wired into fly.toml's
+// health check so a rolling deploy keeps quorum. Always true in local dev mode
+// (a single bootstrap node is healthy as soon as it starts).
 func (cs *ColmenaStore) Healthy() bool {
-	return cs != nil && cs.cluster != nil && cs.cluster.Healthy()
+	if cs == nil {
+		return false
+	}
+	if cs.cluster != nil {
+		return cs.cluster.Healthy()
+	}
+	return true
 }
 
-// Leave gracefully transfers leadership and removes this node from the cluster
-// (called on SIGTERM before the HTTP server shuts down).
+// Leave gracefully shuts the node down (called on SIGTERM before the HTTP
+// server stops). In cluster mode it transfers leadership and removes the node
+// from the configuration; in local mode it just closes the node.
 func (cs *ColmenaStore) Leave(ctx context.Context) {
-	if cs == nil || cs.cluster == nil {
+	if cs == nil {
 		return
 	}
-	if err := cs.cluster.GracefulLeave(ctx); err != nil {
-		log.Printf("[colmena] graceful leave: %v", err)
+	if cs.cluster != nil {
+		if err := cs.cluster.GracefulLeave(ctx); err != nil {
+			log.Printf("[colmena] graceful leave: %v", err)
+		}
+		return
+	}
+	if cs.node != nil {
+		if err := cs.node.Close(); err != nil {
+			log.Printf("[colmena] close: %v", err)
+		}
 	}
 }
 
@@ -239,6 +296,58 @@ func (cs *ColmenaStore) AllWebhooks() (map[string]string, error) {
 			return nil, serr
 		}
 		out[u] = url
+	}
+	return out, rows.Err()
+}
+
+// --- durable mod-forum subscriptions (Raft) ---
+
+// AddModForum subscribes a moderator to a forum slug (idempotent).
+func (cs *ColmenaStore) AddModForum(username, slug string) error {
+	_, err := cs.db.Exec(
+		`INSERT OR IGNORE INTO mod_forums (username, slug) VALUES (?, ?)`, username, slug)
+	return err
+}
+
+// RemoveModForum drops one moderator's subscription to a forum slug.
+func (cs *ColmenaStore) RemoveModForum(username, slug string) error {
+	_, err := cs.db.Exec(`DELETE FROM mod_forums WHERE username = ? AND slug = ?`, username, slug)
+	return err
+}
+
+// GetModForums returns the forum slugs a moderator is subscribed to.
+func (cs *ColmenaStore) GetModForums(username string) ([]string, error) {
+	rows, err := cs.db.Query(`SELECT slug FROM mod_forums WHERE username = ?`, username)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }() // safe-ignore: best-effort cursor close
+	var out []string
+	for rows.Next() {
+		var slug string
+		if serr := rows.Scan(&slug); serr != nil {
+			return nil, serr
+		}
+		out = append(out, slug)
+	}
+	return out, rows.Err()
+}
+
+// AllModForums returns every mod-forum subscription, keyed by moderator
+// username → forum slugs.
+func (cs *ColmenaStore) AllModForums() (map[string][]string, error) {
+	rows, err := cs.db.Query(`SELECT username, slug FROM mod_forums`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }() // safe-ignore: best-effort cursor close
+	out := make(map[string][]string)
+	for rows.Next() {
+		var u, slug string
+		if serr := rows.Scan(&u, &slug); serr != nil {
+			return nil, serr
+		}
+		out[u] = append(out[u], slug)
 	}
 	return out, rows.Err()
 }

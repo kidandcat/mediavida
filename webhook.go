@@ -6,75 +6,46 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
-	"sync"
 	"time"
 )
 
-// WebhookStore manages one webhook URL per MV username, persisted to disk.
+// WebhookStore manages one webhook URL per MV username, backed by Colmena (Raft).
+// There is no in-memory map or JSON-on-disk persistence: every read/write goes
+// straight through the durable store.
 type WebhookStore struct {
-	mu       sync.RWMutex
-	webhooks map[string]string // mv_username -> webhook_url
+	cs *ColmenaStore
 }
 
-func NewWebhookStore() *WebhookStore {
-	ws := &WebhookStore{webhooks: make(map[string]string)}
-	ws.load()
-	return ws
-}
-
-func webhookFile() string {
-	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
-	return filepath.Join(dir, "mediavida-mcp", "webhooks.json")
-}
-
-func (ws *WebhookStore) save() {
-	ws.mu.RLock()
-	data, _ := json.Marshal(ws.webhooks) // safe-ignore: marshaling a static struct never fails
-	ws.mu.RUnlock()
-
-	path := webhookFile()
-	_ = os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Printf("[webhook] failed to save: %v", err)
-	}
-}
-
-func (ws *WebhookStore) load() {
-	data, err := os.ReadFile(webhookFile())
-	if err != nil {
-		return
-	}
-	var m map[string]string
-	if uerr := json.Unmarshal(data, &m); uerr != nil {
-		return
-	}
-	ws.webhooks = m
-	log.Printf("[webhook] restored %d webhooks from disk", len(m))
+// NewWebhookStore wires the store to Colmena, the only persistence layer.
+func NewWebhookStore(cs *ColmenaStore) *WebhookStore {
+	return &WebhookStore{cs: cs}
 }
 
 // Set configures the webhook URL for a user. Replaces any existing one.
 func (ws *WebhookStore) Set(username, url string) {
-	ws.mu.Lock()
-	ws.webhooks[username] = url
-	ws.mu.Unlock()
-	go ws.save() // goroutine-ok: fire-and-forget async save
+	if err := ws.cs.SetWebhook(username, url); err != nil {
+		log.Printf("[webhook] failed to set webhook for %s: %v", username, err)
+	}
 }
 
 // Remove deletes the webhook for a user.
 func (ws *WebhookStore) Remove(username string) {
-	ws.mu.Lock()
-	delete(ws.webhooks, username)
-	ws.mu.Unlock()
-	go ws.save() // goroutine-ok: fire-and-forget async save
+	if err := ws.cs.RemoveWebhook(username); err != nil {
+		log.Printf("[webhook] failed to remove webhook for %s: %v", username, err)
+	}
 }
 
 // Get returns the webhook URL for a user, or empty string if none.
+//
+// The Colmena core exposes no direct GetWebhook lookup, so this reads the full
+// webhook map via AllWebhooks and indexes it by username.
 func (ws *WebhookStore) Get(username string) string {
-	ws.mu.RLock()
-	defer ws.mu.RUnlock()
-	return ws.webhooks[username]
+	all, err := ws.cs.AllWebhooks()
+	if err != nil {
+		log.Printf("[webhook] failed to read webhooks: %v", err)
+		return ""
+	}
+	return all[username]
 }
 
 // Has reports whether a webhook is configured for the user (used by the poller
@@ -83,9 +54,7 @@ func (ws *WebhookStore) Has(username string) bool {
 	if ws == nil {
 		return false
 	}
-	ws.mu.RLock()
-	defer ws.mu.RUnlock()
-	return ws.webhooks[username] != ""
+	return ws.Get(username) != ""
 }
 
 // WebhookPayload is the JSON body sent to the webhook URL.

@@ -7,20 +7,35 @@ primary_region = "cdg"
 [env]
   BASE_URL = "https://mediavida-api.fly.dev"
 
+# Rolling deploy that keeps Raft quorum: replace at most one node at a time so a
+# 3-node cluster never loses more than one voter mid-deploy.
+[deploy]
+  strategy = "rolling"
+  max_unavailable = 1
+
 [http_service]
   internal_port = 8080
   force_https = true
   # Always-on: the server maintains the MV session and polls bubbles for push.
   auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 1
+  # 3-node Raft cluster — keep all voters running for quorum.
+  min_machines_running = 3
+
+  # Gate rolling deploys on Colmena readiness: a replacement node only counts as
+  # healthy once it has joined Raft and caught up (colmenaStore.Healthy()).
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "5s"
+    timeout = "2s"
+    grace_period = "30s"
 
 [[vm]]
-  size = "shared-cpu-1x"
+  size = "shared-cpu-2x"
   memory = "512mb"
 
-# Persist per-device login sessions (~/.config/mediavida-mcp, HOME=/app) so they
-# survive restarts and redeploys.
-[mounts]
-  source = "mvdata"
-  destination = "/app/.config"
+# Durable Colmena data dir (Raft log + SQLite state) — one volume per machine.
+[[mounts]]
+  source = "colmena_data"
+  destination = "/data"

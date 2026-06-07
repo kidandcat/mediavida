@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 )
 
@@ -18,14 +16,18 @@ type Session struct {
 }
 
 // SessionStore manages per-client sessions keyed by client ID (API token).
+// The in-memory map is the hot path; durable persistence is delegated entirely
+// to the Raft-replicated Colmena store (cs) — there is no JSON-on-disk fallback.
 type SessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session // clientID → session
+	cs       *ColmenaStore       // durable, Raft-replicated persistence
 }
 
-func NewSessionStore() *SessionStore {
+func NewSessionStore(cs *ColmenaStore) *SessionStore {
 	return &SessionStore{
 		sessions: make(map[string]*Session),
+		cs:       cs,
 	}
 }
 
@@ -43,27 +45,45 @@ func (ss *SessionStore) Set(clientID string, s *Session) {
 	ss.sessions[clientID] = s
 }
 
-// RestoreFromDisk tries to load a session from disk for the given client ID.
-// Validates the session is still active; if expired, attempts re-login.
-// Returns true if a session was successfully restored.
-func (ss *SessionStore) RestoreFromDisk(clientID string) bool {
-	scraper := NewForumScraper("", "", clientID)
+// RestoreSession tries to load a durable session from Colmena for the given
+// client ID. Validates the session is still active; if expired, attempts
+// re-login. Returns true if a session was successfully restored.
+func (ss *SessionStore) RestoreSession(clientID string) bool {
+	if ss.cs == nil {
+		return false
+	}
+	rec, ok, err := ss.cs.GetSession(clientID)
+	if err != nil {
+		log.Printf("Failed to read session for client %s: %v", clientID, err)
+		return false
+	}
+	if !ok {
+		return false
+	}
+	return ss.restoreFromRecord(rec)
+}
+
+// restoreFromRecord rehydrates a hot *ForumScraper from a durable SessionRecord,
+// validates/re-logs in, and installs it into the in-memory map. Returns true on
+// success.
+func (ss *SessionStore) restoreFromRecord(rec SessionRecord) bool {
+	scraper := NewForumScraper("", "", rec.ClientID, ss.cs)
 	if secret := os.Getenv("MV_TOTP_SECRET"); secret != "" {
 		scraper.SetTOTPSecret(secret)
 	}
-	if !scraper.LoadSession() {
+	if !scraper.loadFromRecord(rec) {
 		return false
 	}
 
 	// Validate the session is still valid server-side
 	if !scraper.ValidateSession() {
-		log.Printf("Session on disk for client %s is expired, attempting re-login", clientID)
+		log.Printf("Session for client %s is expired, attempting re-login", rec.ClientID)
 		if scraper.Username() == "" || scraper.pass == "" {
-			log.Printf("No credentials available for re-login (client %s)", clientID)
+			log.Printf("No credentials available for re-login (client %s)", rec.ClientID)
 			return false
 		}
 		if err := scraper.Relogin(); err != nil {
-			log.Printf("Re-login failed for client %s: %v", clientID, err)
+			log.Printf("Re-login failed for client %s: %v", rec.ClientID, err)
 			return false
 		}
 	}
@@ -73,16 +93,16 @@ func (ss *SessionStore) RestoreFromDisk(clientID string) bool {
 		Status:  "authenticated",
 	}
 	ss.mu.Lock()
-	ss.sessions[clientID] = session
+	ss.sessions[rec.ClientID] = session
 	ss.mu.Unlock()
-	log.Printf("Session restored from disk for client %s (validated)", clientID)
+	log.Printf("Session restored from Colmena for client %s (validated)", rec.ClientID)
 	return true
 }
 
 // CreateFromCredentials logs in with user/pass and stores the session for the given client.
 // Returns ErrGuardRequired if guard verification is needed.
 func (ss *SessionStore) CreateFromCredentials(clientID, user, pass string) error {
-	scraper := NewForumScraper(user, pass, clientID)
+	scraper := NewForumScraper(user, pass, clientID, ss.cs)
 	if secret := os.Getenv("MV_TOTP_SECRET"); secret != "" {
 		scraper.SetTOTPSecret(secret)
 	}
@@ -132,7 +152,7 @@ func (ss *SessionStore) CreateFromCredentials(clientID, user, pass string) error
 // provided credentials, auto-resolving guard verification via MV_TOTP_SECRET.
 // Used at boot so a clean deploy (no session file on disk) self-authenticates.
 func (ss *SessionStore) AutoLogin(clientID, user, pass string) error {
-	scraper := NewForumScraper(user, pass, clientID)
+	scraper := NewForumScraper(user, pass, clientID, ss.cs)
 	if secret := os.Getenv("MV_TOTP_SECRET"); secret != "" {
 		scraper.SetTOTPSecret(secret)
 	}
@@ -145,30 +165,24 @@ func (ss *SessionStore) AutoLogin(clientID, user, pass string) error {
 	return nil
 }
 
-// RestoreAllFromDisk restores every persisted session found on disk (including
+// RestoreAll rehydrates every durable session from the Colmena store (including
 // per-device app-login tokens, not just the configured API tokens). Returns the
 // number of sessions restored. Call once at boot so logins survive restarts.
-func (ss *SessionStore) RestoreAllFromDisk() int {
-	base, err := os.UserConfigDir()
-	if err != nil {
+func (ss *SessionStore) RestoreAll() int {
+	if ss.cs == nil {
 		return 0
 	}
-	dir := filepath.Join(base, "mediavida-mcp")
-	entries, err := os.ReadDir(dir)
+	records, err := ss.cs.AllSessions()
 	if err != nil {
+		log.Printf("Failed to list sessions from Colmena: %v", err)
 		return 0
 	}
 	n := 0
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, "session-") || !strings.HasSuffix(name, ".json") {
+	for _, rec := range records {
+		if rec.ClientID == "" || ss.Get(rec.ClientID) != nil {
 			continue
 		}
-		token := strings.TrimSuffix(strings.TrimPrefix(name, "session-"), ".json")
-		if token == "" || ss.Get(token) != nil {
-			continue
-		}
-		if ss.RestoreFromDisk(token) {
+		if ss.restoreFromRecord(rec) {
 			n++
 		}
 	}

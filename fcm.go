@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -20,84 +19,40 @@ import (
 )
 
 // FCMTokenStore maps a client (device bearer token) to its FCM registration
-// tokens, persisted to disk. A client can have more than one token (reinstalls,
-// token refresh) until the stale ones are pruned on send failure.
+// tokens, durably persisted via Colmena (Raft). A client can have more than one
+// token (reinstalls, token refresh) until the stale ones are pruned on send
+// failure.
 type FCMTokenStore struct {
-	mu     sync.RWMutex
-	tokens map[string][]string // clientID -> []fcmToken
+	cs *ColmenaStore
 }
 
-func NewFCMTokenStore() *FCMTokenStore {
-	s := &FCMTokenStore{tokens: make(map[string][]string)}
-	s.load()
-	return s
+// NewFCMTokenStore builds a token store backed by the Colmena cluster.
+func NewFCMTokenStore(cs *ColmenaStore) *FCMTokenStore {
+	return &FCMTokenStore{cs: cs}
 }
 
-func fcmTokenFile() string {
-	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
-	return filepath.Join(dir, "mediavida-mcp", "push_tokens.json")
-}
-
-func (s *FCMTokenStore) save() {
-	s.mu.RLock()
-	data, _ := json.Marshal(s.tokens) // safe-ignore: marshaling a static struct never fails
-	s.mu.RUnlock()
-	path := fcmTokenFile()
-	_ = os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Printf("[fcm] failed to save tokens: %v", err)
-	}
-}
-
-func (s *FCMTokenStore) load() {
-	data, err := os.ReadFile(fcmTokenFile())
-	if err != nil {
-		return
-	}
-	var m map[string][]string
-	if uerr := json.Unmarshal(data, &m); uerr != nil {
-		return
-	}
-	s.tokens = m
-	log.Printf("[fcm] restored push tokens for %d client(s)", len(m))
-}
-
-// Add registers an FCM token for a client (deduped).
+// Add registers an FCM token for a client (deduped at the storage layer).
 func (s *FCMTokenStore) Add(clientID, token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, t := range s.tokens[clientID] {
-		if t == token {
-			return
-		}
+	if err := s.cs.AddFCMToken(clientID, token); err != nil {
+		log.Printf("[fcm] failed to add token for %s: %v", clientID, err)
 	}
-	s.tokens[clientID] = append(s.tokens[clientID], token)
-	go s.save() // goroutine-ok: fire-and-forget async save
 }
 
 // Remove deletes a specific token from a client (e.g. when FCM reports it stale).
 func (s *FCMTokenStore) Remove(clientID, token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	kept := s.tokens[clientID][:0]
-	for _, t := range s.tokens[clientID] {
-		if t != token {
-			kept = append(kept, t)
-		}
+	if err := s.cs.RemoveFCMToken(clientID, token); err != nil {
+		log.Printf("[fcm] failed to remove token for %s: %v", clientID, err)
 	}
-	if len(kept) == 0 {
-		delete(s.tokens, clientID)
-	} else {
-		s.tokens[clientID] = kept
-	}
-	go s.save() // goroutine-ok: fire-and-forget async save
 }
 
-// Get returns a copy of the client's tokens.
+// Get returns the client's registered tokens (empty slice on error).
 func (s *FCMTokenStore) Get(clientID string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return append([]string(nil), s.tokens[clientID]...)
+	tokens, err := s.cs.GetFCMTokens(clientID)
+	if err != nil {
+		log.Printf("[fcm] failed to get tokens for %s: %v", clientID, err)
+		return nil
+	}
+	return tokens
 }
 
 // FCMSender sends push via the FCM HTTP v1 API using a service account. nil when

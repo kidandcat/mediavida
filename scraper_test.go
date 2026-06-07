@@ -42,7 +42,7 @@ func TestLoginFlow(t *testing.T) {
 		t.Skip("MV_USERNAME or MV_PASSWORD not set — skipping integration test")
 	}
 
-	s := NewForumScraper(user, pass, "")
+	s := NewForumScraper(user, pass, "", nil)
 
 	// Step 1: GET /login — should return the login page with CSRF token
 	t.Log("Step 1: GET /login")
@@ -67,7 +67,7 @@ func TestLoginFlow(t *testing.T) {
 
 	// Step 2: Full Login()
 	t.Log("Step 2: Full Login()")
-	s2 := NewForumScraper(user, pass, "")
+	s2 := NewForumScraper(user, pass, "", nil)
 	err = s2.Login()
 	if err != nil {
 		if fmt.Sprintf("%T", err) == "*main.ErrGuardRequired" {
@@ -88,7 +88,7 @@ func TestSearchDebug(t *testing.T) {
 		t.Skip("MV_USERNAME or MV_PASSWORD not set")
 	}
 
-	s := NewForumScraper(user, pass, "")
+	s := NewForumScraper(user, pass, "", nil)
 	if !s.LoadSession() {
 		t.Skip("no saved session")
 	}

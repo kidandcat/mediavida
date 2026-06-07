@@ -67,6 +67,7 @@ github.com/mattn/go-isatty
 github.com/mentasystems/colmena
 github.com/mentasystems/colmena/cluster
 github.com/mentasystems/colmena/fly
+github.com/mentasystems/colmena/jobs
 # github.com/ncruces/go-strftime v0.1.9
 ## explicit; go 1.17
 github.com/ncruces/go-strftime

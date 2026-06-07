@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	stdtls "crypto/tls"
 	"encoding/base32"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,8 +19,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"os"
-	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +72,15 @@ type ForumScraper struct {
 	clientID     string    // for per-client session persistence
 	lastSaveTime time.Time // tracks last session save to avoid excessive writes
 	totpSecret   string    // base32 TOTP secret for automatic guard verification
+
+	// cs is the durable, Raft-replicated store — the ONLY persistence layer.
+	// There is no JSON-on-disk fallback.
+	cs *ColmenaStore
+	// lastCookieFingerprint is a hash of ONLY the auth cookies as of the last
+	// PutSession. SaveSession is called frequently (the poller fires it every
+	// ~20 polls and on every change), so we debounce writes to the Raft log:
+	// we only PutSession when this fingerprint actually changes. Guarded by mu.
+	lastCookieFingerprint string
 }
 
 // isLoggedIn reports the current login state under the read lock.
@@ -126,7 +136,7 @@ func newChromeTransport() http.RoundTripper {
 	}
 }
 
-func NewForumScraper(user, pass, clientID string) *ForumScraper {
+func NewForumScraper(user, pass, clientID string, cs *ColmenaStore) *ForumScraper {
 	jar, _ := cookiejar.New(nil) // safe-ignore: cookiejar.New(nil) never returns an error
 	return &ForumScraper{
 		client: &http.Client{
@@ -137,6 +147,7 @@ func NewForumScraper(user, pass, clientID string) *ForumScraper {
 		user:     user,
 		pass:     pass,
 		clientID: clientID,
+		cs:       cs,
 	}
 }
 
@@ -315,16 +326,6 @@ func (s *ForumScraper) SubmitGuard(guardURL, code string) error {
 	return nil
 }
 
-// sessionFile returns the path to the session cookie file.
-// If clientID is non-empty, returns a per-client session file.
-func sessionFile(clientID string) string {
-	dir, _ := os.UserConfigDir() // safe-ignore: falls back to relative path
-	if clientID == "" {
-		return filepath.Join(dir, "mediavida-mcp", "session.json")
-	}
-	return filepath.Join(dir, "mediavida-mcp", "session-"+clientID+".json")
-}
-
 // savedSession is the JSON-serializable session state including credentials and cookies.
 type savedSession struct {
 	User    string        `json:"user"`
@@ -344,10 +345,58 @@ type savedCookie struct {
 	HttpOnly bool      `json:"http_only,omitempty"`
 }
 
-// SaveSession persists cookies and credentials to disk so the user doesn't need to log in every time.
+// authCookieFingerprint returns a stable hash over ONLY the auth-relevant
+// cookies (sess, _t, remember-style). These are the cookies whose change marks
+// a materially-different session (login / guard / re-login); everything else
+// (CSRF, per-page churn) must NOT trigger a Raft write.
+func authCookieFingerprint(cookies []*http.Cookie) string {
+	// Collect name=value for the auth cookies, sorted by name for stability.
+	var pairs []string
+	for _, c := range cookies {
+		if isAuthCookie(c.Name) {
+			pairs = append(pairs, c.Name+"="+c.Value)
+		}
+	}
+	sort.Strings(pairs)
+	sum := sha256.Sum256([]byte(strings.Join(pairs, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
+// isAuthCookie reports whether a cookie name carries authentication state worth
+// persisting (the MV session cookie, the long-lived "_t"/remember token, etc.).
+func isAuthCookie(name string) bool {
+	switch name {
+	case "sess", "_t", "remember", "mvauth", "auth":
+		return true
+	}
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "sess") || strings.Contains(lower, "remember")
+}
+
+// SaveSession persists cookies and credentials to the durable Colmena store so
+// the user doesn't need to log in every time.
+//
+// ANTI-CHURN: this is called frequently (the poller fires it every ~20 polls
+// and on every change). Writing to the Raft log each time would flood it, so we
+// only call cs.PutSession when the fingerprint of the AUTH cookies actually
+// changed since the last save. Per-poll refreshes of non-auth cookies are a
+// no-op here.
 func (s *ForumScraper) SaveSession() {
+	if s.cs == nil {
+		return
+	}
 	u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
 	cookies := s.client.Jar.Cookies(u)
+
+	fp := authCookieFingerprint(cookies)
+	s.mu.Lock()
+	unchanged := fp == s.lastCookieFingerprint && s.lastCookieFingerprint != ""
+	s.mu.Unlock()
+	if unchanged {
+		// Auth cookies are identical to the last replicated set — skip the write.
+		return
+	}
+
 	var saved []savedCookie
 	for _, c := range cookies {
 		expires := c.Expires
@@ -369,13 +418,21 @@ func (s *ForumScraper) SaveSession() {
 		})
 	}
 	sess := savedSession{User: s.user, Pass: s.pass, Cookies: saved}
-	path := sessionFile(s.clientID)
-	os.MkdirAll(filepath.Dir(path), 0700) // safe-ignore: best-effort dir create; later write reports real errors
-	data, _ := json.Marshal(sess)         // safe-ignore: marshaling a static struct never fails
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Printf("Failed to save session: %v", err)
+	data, _ := json.Marshal(sess) // safe-ignore: marshaling a static struct never fails
+
+	if err := s.cs.PutSession(SessionRecord{
+		ClientID: s.clientID,
+		User:     s.user,
+		Pass:     s.pass,
+		Cookies:  string(data),
+	}); err != nil {
+		log.Printf("Failed to save session for client %s: %v", s.clientID, err)
+		return
 	}
+	s.mu.Lock()
+	s.lastCookieFingerprint = fp
 	s.lastSaveTime = time.Now()
+	s.mu.Unlock()
 }
 
 // AutoSave saves the session if at least 2 minutes have passed since the last save.
@@ -386,57 +443,46 @@ func (s *ForumScraper) AutoSave() {
 	}
 }
 
-// LoadSession restores cookies and credentials from disk. Returns true if a session was loaded.
+// LoadSession restores cookies and credentials from the durable Colmena store.
+// Returns true if a session was loaded.
 func (s *ForumScraper) LoadSession() bool {
-	data, err := os.ReadFile(sessionFile(s.clientID))
+	if s.cs == nil {
+		return false
+	}
+	rec, ok, err := s.cs.GetSession(s.clientID)
 	if err != nil {
+		log.Printf("Failed to load session for client %s: %v", s.clientID, err)
 		return false
 	}
+	if !ok {
+		return false
+	}
+	return s.loadFromRecord(rec)
+}
 
-	// Try new format (with credentials)
+// loadFromRecord rehydrates the scraper's cookie jar and credentials from a
+// durable SessionRecord. Returns true if at least one non-expired cookie was
+// loaded. Shared by LoadSession and the boot-time rehydration path.
+func (s *ForumScraper) loadFromRecord(rec SessionRecord) bool {
 	var sess savedSession
-	if uerr := json.Unmarshal(data, &sess); uerr == nil && len(sess.Cookies) > 0 {
-		if sess.User != "" {
-			s.user = sess.User
-			s.pass = sess.Pass
-		}
-		u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
-		var cookies []*http.Cookie
-		for _, sc := range sess.Cookies {
-			// Skip expired cookies
-			if !sc.Expires.IsZero() && sc.Expires.Before(time.Now()) {
-				log.Printf("Skipping expired cookie %s (expired %s)", sc.Name, sc.Expires.Format(time.RFC3339))
-				continue
-			}
-			cookies = append(cookies, &http.Cookie{
-				Name:     sc.Name,
-				Value:    sc.Value,
-				Domain:   sc.Domain,
-				Path:     sc.Path,
-				Expires:  sc.Expires,
-				MaxAge:   sc.MaxAge,
-				Secure:   sc.Secure,
-				HttpOnly: sc.HttpOnly,
-			})
-		}
-		if len(cookies) == 0 {
-			log.Printf("All cookies expired for user %s", s.user)
-			return false
-		}
-		s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies) // safe-ignore: jar is always *cookiejar.Jar
-		s.setLoggedIn(true)
-		log.Printf("Session restored from disk (user: %s, %d cookies)", s.user, len(cookies))
-		return true
-	}
-
-	// Fallback: old format (array of cookies only)
-	var saved []savedCookie
-	if uerr := json.Unmarshal(data, &saved); uerr != nil {
+	if uerr := json.Unmarshal([]byte(rec.Cookies), &sess); uerr != nil || len(sess.Cookies) == 0 {
 		return false
+	}
+	if sess.User != "" {
+		s.user = sess.User
+		s.pass = sess.Pass
+	} else if rec.User != "" {
+		s.user = rec.User
+		s.pass = rec.Pass
 	}
 	u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
 	var cookies []*http.Cookie
-	for _, sc := range saved {
+	for _, sc := range sess.Cookies {
+		// Skip expired cookies
+		if !sc.Expires.IsZero() && sc.Expires.Before(time.Now()) {
+			log.Printf("Skipping expired cookie %s (expired %s)", sc.Name, sc.Expires.Format(time.RFC3339))
+			continue
+		}
 		cookies = append(cookies, &http.Cookie{
 			Name:     sc.Name,
 			Value:    sc.Value,
@@ -448,16 +494,34 @@ func (s *ForumScraper) LoadSession() bool {
 			HttpOnly: sc.HttpOnly,
 		})
 	}
+	if len(cookies) == 0 {
+		log.Printf("All cookies expired for user %s", s.user)
+		return false
+	}
 	s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies) // safe-ignore: jar is always *cookiejar.Jar
+	// Seed the fingerprint from the loaded cookies so the next SaveSession is a
+	// no-op unless the auth cookie set actually changes (ANTI-CHURN).
+	fp := authCookieFingerprint(cookies)
+	s.mu.Lock()
+	s.lastCookieFingerprint = fp
+	s.mu.Unlock()
 	s.setLoggedIn(true)
-	log.Println("Session restored from disk (legacy format)")
+	log.Printf("Session restored from Colmena (user: %s, %d cookies)", s.user, len(cookies))
 	return true
 }
 
-// ClearSession removes the saved session file.
+// ClearSession removes the saved session from the durable store and resets the
+// in-memory login state and cookie jar.
 func (s *ForumScraper) ClearSession() {
-	_ = os.Remove(sessionFile(s.clientID)) // safe-ignore: best-effort cleanup
+	if s.cs != nil {
+		if err := s.cs.DeleteSession(s.clientID); err != nil {
+			log.Printf("Failed to delete session for client %s: %v", s.clientID, err)
+		}
+	}
 	s.setLoggedIn(false)
+	s.mu.Lock()
+	s.lastCookieFingerprint = ""
+	s.mu.Unlock()
 	// Reset cookie jar so stale cookies don't interfere with re-login
 	jar, _ := cookiejar.New(nil) // safe-ignore: cookiejar.New(nil) never returns an error
 	s.client.Jar = jar

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -87,6 +88,11 @@ func main() {
 	modForums := NewModForumsStore()
 	hub := NewEventHub()
 
+	// Colmena: durable Raft-replicated store for HA (PLAN_SCALE Phase 2). Returns
+	// nil unless running in a Fly cluster, in which case the app keeps its local
+	// JSON persistence — so this is inert until the multi-node deploy is enabled.
+	colmenaStore := StartColmena()
+
 	// Restore MV sessions from disk for all known API tokens. If no session is
 	// on disk (e.g. a fresh deploy), fall back to a headless auto-login using
 	// MV_USERNAME/MV_PASSWORD (+ MV_TOTP_SECRET for guard) so the server is
@@ -162,6 +168,17 @@ func main() {
 	apiHandler := APITokenMiddleware(apiTokens, sessions, limiter.Middleware(apiMux))
 
 	root := http.NewServeMux()
+	// Health check for Fly's rolling deploy (keeps Raft quorum). 200 unless a
+	// Colmena node is up but not yet caught up. Single-node (colmenaStore nil)
+	// always reports healthy.
+	root.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if colmenaStore == nil || colmenaStore.Healthy() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok")) // safe-ignore: best-effort health body
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
 	root.Handle("/auth/app-login", publicMux)
 	// /auth/login serves both the browser flow (GET ?flow / POST form) and the
 	// headless JSON direct-login (POST application/json). Dispatch by method +
@@ -184,7 +201,7 @@ func main() {
 	log.Printf("  REST API:  %s (Bearer token required)", baseURL)
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
@@ -205,6 +222,13 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("graceful shutdown timed out: %v", err)
+	}
+	// Leave the Raft cluster last (transfers leadership) so a rolling deploy
+	// keeps quorum. No-op when Colmena is disabled.
+	if colmenaStore != nil {
+		leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 8*time.Second)
+		colmenaStore.Leave(leaveCtx)
+		leaveCancel()
 	}
 	log.Println("shutdown complete")
 }

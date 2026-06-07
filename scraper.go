@@ -1859,6 +1859,29 @@ type ThreadPage struct {
 
 // FetchThread scrapes a single page of a thread and returns the messages with pagination info.
 // If page <= 0, it fetches the last page.
+// threadPageURL builds the URL for a given page of a thread, supporting both
+// the pretty form (.../slug-tid -> .../slug-tid/N) and the legacy query form
+// used by notification links (.../foro/tema.php?tid=X&pagina=Y#post -> set
+// pagina=N). The fragment is always dropped.
+func threadPageURL(threadURL string, page int) string {
+	if i := strings.IndexByte(threadURL, '#'); i >= 0 {
+		threadURL = threadURL[:i]
+	}
+	if strings.Contains(threadURL, "tema.php") || strings.Contains(threadURL, "tid=") {
+		if u, err := url.Parse(threadURL); err == nil {
+			q := u.Query()
+			q.Set("pagina", strconv.Itoa(page))
+			u.RawQuery = q.Encode()
+			u.Fragment = ""
+			return u.String()
+		}
+	}
+	if page <= 1 {
+		return threadURL
+	}
+	return fmt.Sprintf("%s/%d", threadURL, page)
+}
+
 func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, error) {
 	if !s.loggedIn {
 		if err := s.Login(); err != nil {
@@ -1869,7 +1892,7 @@ func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, err
 	s.threadURL = threadURL
 
 	// First fetch page 1 to discover total pages
-	resp, err := s.doGet(threadURL)
+	resp, err := s.doGet(threadPageURL(threadURL, 1))
 	if err != nil {
 		return nil, err
 	}
@@ -1905,7 +1928,7 @@ func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, err
 	}
 
 	// Otherwise fetch the target page
-	pageURL := fmt.Sprintf("%s/%d", threadURL, targetPage)
+	pageURL := threadPageURL(threadURL, targetPage)
 	messages, err := s.fetchPage(pageURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch page %d: %w", targetPage, err)

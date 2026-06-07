@@ -2,13 +2,36 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 )
+
+// raiseNOFILE lifts the open-file-descriptor soft limit to the hard max. With
+// ~2000 SSE streams plus outbound MV connections the process needs several
+// thousand fds; the common 1024 default would fail before RAM does.
+func raiseNOFILE() {
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		log.Printf("[rlimit] getrlimit NOFILE failed: %v", err)
+		return
+	}
+	if lim.Cur < lim.Max {
+		lim.Cur = lim.Max
+		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+			log.Printf("[rlimit] setrlimit NOFILE failed: %v", err)
+			return
+		}
+	}
+	log.Printf("[rlimit] NOFILE cur=%d max=%d", lim.Cur, lim.Max)
+}
 
 func loadEnvFile() {
 	f, err := os.Open(".env")
@@ -49,6 +72,7 @@ func main() {
 	addr := flag.String("addr", ":1234", "HTTP listen address")
 	flag.Parse()
 
+	raiseNOFILE()
 	loadEnvFile()
 
 	apiTokens := parseAPITokens()
@@ -131,7 +155,11 @@ func main() {
 	apiMux := http.NewServeMux()
 	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, fcmTokens, baseURL)
 
-	apiHandler := APITokenMiddleware(apiTokens, sessions, apiMux)
+	// Per-client API rate limiter (PLAN_SCALE 2.2 / Phase 1). Sits AFTER auth so
+	// it can read the clientID from the request context. Defaults: ~5 req/s
+	// sustained, burst 20.
+	limiter := NewRateLimiter(5, 20)
+	apiHandler := APITokenMiddleware(apiTokens, sessions, limiter.Middleware(apiMux))
 
 	root := http.NewServeMux()
 	root.Handle("/auth/app-login", publicMux)
@@ -148,9 +176,35 @@ func main() {
 	root.Handle("/auth/guard", publicMux)
 	root.Handle("/", apiHandler)
 
+	srv := &http.Server{Addr: *addr, Handler: root}
+
 	log.Printf("Mediavida API listening on %s", *addr)
 	log.Printf("  Base URL:  %s", baseURL)
 	log.Printf("  Auth UI:   %s/auth/login (browser flow)", baseURL)
 	log.Printf("  REST API:  %s (Bearer token required)", baseURL)
-	log.Fatal(http.ListenAndServe(*addr, root))
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	// Graceful shutdown: Fly sends SIGTERM before replacing/killing the machine.
+	// Stop the background loops first so they can't publish to SSE channels that
+	// are mid-drain, end the SSE streams, then let in-flight requests finish.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigCh
+	log.Printf("received %s — shutting down gracefully", sig)
+
+	poller.Stop()
+	keepAlive.Stop()
+	hub.Shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("graceful shutdown timed out: %v", err)
+	}
+	log.Println("shutdown complete")
 }

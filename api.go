@@ -10,7 +10,20 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// sharedCache holds the marshaled JSON of pages that are identical for every
+// user (portada, forum index), so concurrent users collapse to one MV fetch
+// per TTL window. It only short-circuits the scrape + serialization, never auth.
+var sharedCache = NewTTLCache(30 * time.Second) // global-ok: process-wide shared-page cache
+
+// writeCachedJSON writes pre-marshaled JSON bytes with the JSON content type.
+func writeCachedJSON(w http.ResponseWriter, body []byte) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body) // safe-ignore: best-effort write, response already committed
+}
 
 // --- helpers ---
 
@@ -243,6 +256,11 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		if scraper == nil {
 			return
 		}
+		const cacheKey = "portada"
+		if body, ok := sharedCache.Get(cacheKey); ok {
+			writeCachedJSON(w, body)
+			return
+		}
 		var items []PortadaItem
 		err := withRelogin(scraper, func() error {
 			var e error
@@ -253,12 +271,22 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeAPIError(w, err)
 			return
 		}
+		if body, err := json.Marshal(map[string]any{"items": items}); err == nil {
+			sharedCache.Set(cacheKey, body)
+			writeCachedJSON(w, body)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	})
 
 	mux.HandleFunc("GET /forums", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)
 		if scraper == nil {
+			return
+		}
+		const cacheKey = "forums"
+		if body, ok := sharedCache.Get(cacheKey); ok {
+			writeCachedJSON(w, body)
 			return
 		}
 		var cats []ForumCategory
@@ -269,6 +297,11 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		})
 		if err != nil {
 			writeAPIError(w, err)
+			return
+		}
+		if body, err := json.Marshal(map[string]any{"categories": cats}); err == nil {
+			sharedCache.Set(cacheKey, body)
+			writeCachedJSON(w, body)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"categories": cats})

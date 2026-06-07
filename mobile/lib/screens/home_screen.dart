@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -22,7 +23,17 @@ class HomeScreen extends ConsumerStatefulWidget {
 
 class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObserver {
   int _index = 0;
-  Timer? _timer;
+
+  // Self-scheduling bubbles poll with exponential backoff + jitter. On
+  // consecutive errors the interval grows (25→50→100s, capped) so a struggling
+  // backend isn't hammered; ±20% jitter de-syncs clients. The backoff resets on
+  // any successful fetch and on app resume — otherwise badges would go stale,
+  // stuck polling at the cap.
+  Timer? _pollTimer;
+  int _pollFailures = 0;
+  static const _pollBase = Duration(seconds: 25);
+  static const _pollMax = Duration(minutes: 5);
+  static final _rand = Random();
 
   static const _tabs = [
     ForumIndexScreen(),
@@ -41,26 +52,60 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
       ref.read(configProvider.notifier).verifySession();
     });
     // Poll the notification counters so badges clear after reading.
-    _timer = Timer.periodic(const Duration(seconds: 25), (_) => _refreshBubbles());
+    _scheduleNextPoll();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _timer?.cancel();
+    _pollTimer?.cancel();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _refreshBubbles();
+      // Resume from background: reset backoff and poll immediately so badges
+      // don't stay stuck at the cap interval after a flaky period.
+      _pollFailures = 0;
+      _pollNow();
       ref.read(configProvider.notifier).verifySession();
       // Returning to the foreground (e.g. after tapping a push) clears the tray.
       NotificationService().clearDelivered();
     }
   }
 
+  /// Current poll interval: base doubled per consecutive failure, capped, with
+  /// ±20% random jitter.
+  Duration _pollInterval() {
+    final exp = _pollBase.inMilliseconds * (1 << _pollFailures.clamp(0, 10));
+    final capped = exp.clamp(0, _pollMax.inMilliseconds);
+    final jitter = capped * (0.2 * (_rand.nextDouble() * 2 - 1));
+    return Duration(milliseconds: (capped + jitter).round());
+  }
+
+  void _scheduleNextPoll() {
+    _pollTimer?.cancel();
+    if (!mounted) return;
+    _pollTimer = Timer(_pollInterval(), _pollNow);
+  }
+
+  /// Refresh the bubbles, then reschedule with backoff based on the outcome.
+  Future<void> _pollNow() async {
+    if (!mounted) return;
+    ref.invalidate(bubblesProvider);
+    try {
+      await ref.read(bubblesProvider.future);
+      _pollFailures = 0; // success → back to base interval
+    } catch (_) {
+      _pollFailures++; // grow the interval (capped)
+    }
+    _scheduleNextPoll();
+  }
+
+  /// Triggered by SSE pushes, tab switches and nav taps: refresh the counters
+  /// without disturbing the poll schedule. The dedup in MvApi.bubbles()
+  /// collapses this with a concurrent poll so it doesn't double the GET.
   void _refreshBubbles() {
     if (mounted) ref.invalidate(bubblesProvider);
   }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -24,6 +25,7 @@ class NotificationService {
   NotificationService._internal();
 
   final FlutterLocalNotificationsPlugin _local = FlutterLocalNotificationsPlugin();
+  static final _rand = Random();
 
   bool _initialized = false;
   String? _deviceToken; // backend bearer, used to register the FCM token
@@ -105,18 +107,35 @@ class NotificationService {
     }
   }
 
+  /// Register the FCM token with the backend, retrying transient failures.
+  ///
+  /// A single fire-and-forget POST used to silently drop push registration if it
+  /// hit a 429/503 (e.g. during a backend deploy). Retry a few times with a
+  /// short bounded backoff + jitter so a transient blip recovers on its own.
   Future<void> _register(String fcmToken) async {
     final device = _deviceToken;
     if (device == null) return;
-    try {
-      final r = await http.post(
-        Uri.parse('${AppConfig.apiBaseUrl}/push/register'),
-        headers: {'Authorization': 'Bearer $device', 'Content-Type': 'application/json'},
-        body: '{"token":"$fcmToken"}',
-      );
-      debugPrint('[fcm] register: HTTP ${r.statusCode}');
-    } catch (e) {
-      debugPrint('[fcm] register failed: $e');
+    const maxTries = 3;
+    for (var attempt = 0; attempt < maxTries; attempt++) {
+      // Bail if the device logged out (or token changed) between retries.
+      if (_deviceToken != device) return;
+      try {
+        final r = await http.post(
+          Uri.parse('${AppConfig.apiBaseUrl}/push/register'),
+          headers: {'Authorization': 'Bearer $device', 'Content-Type': 'application/json'},
+          body: '{"token":"$fcmToken"}',
+        );
+        debugPrint('[fcm] register: HTTP ${r.statusCode} (try ${attempt + 1})');
+        if (r.statusCode >= 200 && r.statusCode < 300) return;
+        // Non-2xx (incl. 429/503): fall through to backoff unless out of tries.
+      } catch (e) {
+        debugPrint('[fcm] register failed (try ${attempt + 1}): $e');
+      }
+      if (attempt < maxTries - 1) {
+        final ms = 500 * (1 << attempt);
+        final jitter = (ms * 0.2 * (_rand.nextDouble() * 2 - 1)).round();
+        await Future<void>.delayed(Duration(milliseconds: ms + jitter));
+      }
     }
   }
 

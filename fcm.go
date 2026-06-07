@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -148,6 +150,22 @@ type fcmV1Message struct {
 	} `json:"message"`
 }
 
+const (
+	// fcmMaxConcurrency bounds the number of in-flight FCM POSTs per
+	// NotifyBubbleIncrease call (FCM HTTP v1 has no multicast endpoint).
+	fcmMaxConcurrency = 8
+	// fcmMaxRetries is the number of extra attempts after the first on a
+	// transient (429 / 5xx) FCM response.
+	fcmMaxRetries = 3
+	// fcmBaseBackoff is the base delay for exponential backoff between retries.
+	fcmBaseBackoff = 500 * time.Millisecond
+	// fcmMaxBackoff caps a single backoff wait.
+	fcmMaxBackoff = 10 * time.Second
+)
+
+// sendOne posts a single notification to one token, retrying on transient
+// (429 / 5xx) FCM responses with bounded exponential backoff (honouring a
+// Retry-After header when present), and pruning the token on a 404/400.
 func (f *FCMSender) sendOne(clientID, token, title, body string) {
 	var m fcmV1Message
 	m.Message.Token = token
@@ -158,36 +176,104 @@ func (f *FCMSender) sendOne(clientID, token, title, body string) {
 
 	payload, _ := json.Marshal(m) // safe-ignore: marshaling a static struct never fails
 	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", f.projectID)
+
+	for attempt := 0; ; attempt++ {
+		retryAfter, done := f.sendAttempt(clientID, token, url, payload)
+		if done {
+			return
+		}
+		if attempt >= fcmMaxRetries {
+			log.Printf("[fcm] giving up on token for %s after %d retries", clientID, fcmMaxRetries)
+			return
+		}
+		wait := retryAfter
+		if wait <= 0 {
+			wait = fcmBackoff(attempt)
+		}
+		time.Sleep(wait)
+	}
+}
+
+// sendAttempt performs a single FCM POST. It returns done=true when no further
+// retry should happen (success, prune, non-retryable error, or unrecoverable
+// local error), and otherwise done=false with a suggested Retry-After delay
+// (0 when none was supplied, so the caller falls back to exponential backoff).
+func (f *FCMSender) sendAttempt(clientID, token, url string, payload []byte) (retryAfter time.Duration, done bool) {
 	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
 	if err != nil {
-		return
+		return 0, true
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	tok, err := f.tokens.Token()
 	if err != nil {
 		log.Printf("[fcm] oauth token error: %v", err)
-		return
+		return 0, true
 	}
 	tok.SetAuthHeader(req)
 
 	resp, err := f.client.Do(req)
 	if err != nil {
+		// Network/timeout errors are transient → allow a retry.
 		log.Printf("[fcm] send failed: %v", err)
-		return
+		return 0, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
-		return
+		return 0, true
 	}
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024)) // safe-ignore: body already validated / best-effort read
 	// 404 UNREGISTERED / 400 invalid token → prune it so we stop trying.
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
 		log.Printf("[fcm] pruning stale token for %s (HTTP %d)", clientID, resp.StatusCode)
 		f.store.Remove(clientID, token)
-		return
+		return 0, true
+	}
+	// 429 Too Many Requests / 5xx → transient, retry with backoff.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		log.Printf("[fcm] transient error for %s (HTTP %d), will retry", clientID, resp.StatusCode)
+		return parseRetryAfter(resp.Header.Get("Retry-After")), false
 	}
 	log.Printf("[fcm] send rejected (HTTP %d): %s", resp.StatusCode, string(respBody))
+	return 0, true
+}
+
+// fcmBackoff returns the exponential-backoff delay for the given attempt index
+// (0-based), with full jitter, capped at fcmMaxBackoff.
+func fcmBackoff(attempt int) time.Duration {
+	d := fcmBaseBackoff << uint(attempt)
+	if d > fcmMaxBackoff || d <= 0 {
+		d = fcmMaxBackoff
+	}
+	// Full jitter to avoid a thundering herd of retries.
+	return time.Duration(rand.Int63n(int64(d) + 1)) // #nosec G404 -- jitter, not security-sensitive
+}
+
+// parseRetryAfter interprets a Retry-After header (delay-seconds form only;
+// HTTP-date form is ignored). Returns 0 when absent/unparseable so the caller
+// falls back to exponential backoff.
+func parseRetryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(h)
+	if err != nil || secs < 0 {
+		return 0
+	}
+	d := time.Duration(secs) * time.Second
+	if d > fcmMaxBackoff {
+		d = fcmMaxBackoff
+	}
+	return d
+}
+
+// HasTokens reports whether this client has at least one registered FCM token,
+// i.e. push can reach it even with no SSE subscriber. nil-safe.
+func (f *FCMSender) HasTokens(clientID string) bool {
+	if f == nil || f.store == nil {
+		return false
+	}
+	return len(f.store.Get(clientID)) > 0
 }
 
 // NotifyBubbleIncrease pushes (via FCM) for each counter that went up. No-op when
@@ -196,7 +282,7 @@ func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles
 	if f == nil || prev == nil || current == nil {
 		return
 	}
-	tokens := f.store.Get(clientID)
+	tokens := dedupTokens(f.store.Get(clientID))
 	if len(tokens) == 0 {
 		return
 	}
@@ -216,9 +302,56 @@ func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles
 			plural(current.Favorites, "Actividad nueva en %d hilo favorito", "Actividad nueva en %d hilos favoritos")})
 	}
 
+	if len(pushes) == 0 {
+		return
+	}
+
+	// Fan the per-(message × token) POSTs out over a small bounded worker pool.
+	// FCM HTTP v1 has no multicast endpoint, so this is the closest we get to a
+	// batch send while staying friendly to FCM rate limits.
+	type job struct {
+		token, title, body string
+	}
+	jobs := make(chan job)
+	concurrency := fcmMaxConcurrency
+	if total := len(pushes) * len(tokens); total < concurrency {
+		concurrency = total
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				f.sendOne(clientID, j.token, j.title, j.body)
+			}
+		}()
+	}
+
 	for _, p := range pushes {
 		for _, t := range tokens {
-			f.sendOne(clientID, t, p.title, p.body)
+			jobs <- job{token: t, title: p.title, body: p.body}
 		}
 	}
+	close(jobs)
+	wg.Wait()
+}
+
+// dedupTokens returns the input with exact duplicates removed, preserving order.
+// Distinct device tokens for the same client are kept.
+func dedupTokens(tokens []string) []string {
+	if len(tokens) < 2 {
+		return tokens
+	}
+	seen := make(map[string]struct{}, len(tokens))
+	out := tokens[:0]
+	for _, t := range tokens {
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }

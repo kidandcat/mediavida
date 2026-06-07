@@ -14,10 +14,21 @@ import (
 type EventHub struct {
 	mu          sync.RWMutex
 	subscribers map[string]map[chan []byte]struct{} // clientID → set of buffered channels
+	done        chan struct{}                       // closed on Shutdown to end all SSE streams
+	closeOnce   sync.Once
 }
 
 func NewEventHub() *EventHub {
-	return &EventHub{subscribers: make(map[string]map[chan []byte]struct{})}
+	return &EventHub{
+		subscribers: make(map[string]map[chan []byte]struct{}),
+		done:        make(chan struct{}),
+	}
+}
+
+// Shutdown ends every active SSE stream promptly so graceful HTTP shutdown does
+// not block on long-lived connections. Idempotent.
+func (h *EventHub) Shutdown() {
+	h.closeOnce.Do(func() { close(h.done) })
 }
 
 // subscribe registers a new channel for a client and returns it together with the unsubscribe func.
@@ -107,6 +118,9 @@ func (h *EventHub) ServeSSE(w http.ResponseWriter, r *http.Request, clientID str
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-h.done:
+			// Server is shutting down — end the stream so Shutdown can return.
 			return
 		case <-keepalive.C:
 			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {

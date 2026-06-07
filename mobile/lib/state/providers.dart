@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:math';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/models.dart';
@@ -113,11 +116,52 @@ final bubblesProvider = FutureProvider<Bubbles>((ref) async {
   return api.bubbles();
 });
 
-/// Live notification stream (SSE). Falls back gracefully when disconnected.
+/// Live notification stream (SSE) with auto-reconnect.
+///
+/// `events()` completes when the connection drops or its idle watchdog fires;
+/// this loop reconnects with exponential backoff + jitter (capped) so an outage
+/// doesn't turn into a tight reconnect storm. The backoff resets once a
+/// connection has stayed up long enough to be considered healthy. A 401 stops
+/// reconnecting (the app drops to login via onUnauthorized inside events()).
 final bubblesStreamProvider = StreamProvider<Bubbles>((ref) async* {
   final api = ref.watch(apiProvider);
   if (api == null) return;
-  yield* api.events();
+
+  const baseDelay = Duration(seconds: 2);
+  const maxDelay = Duration(minutes: 5);
+  const healthyAfter = Duration(seconds: 30);
+  final rand = Random();
+
+  var disposed = false;
+  ref.onDispose(() => disposed = true);
+
+  var attempt = 0;
+  while (!disposed) {
+    final start = DateTime.now();
+    try {
+      yield* api.events();
+      // Stream ended without error (idle watchdog or server closed it).
+    } on MvApiException catch (e) {
+      // 401 already triggered onUnauthorized; stop trying to reconnect.
+      if (e.statusCode == 401) return;
+    } catch (_) {
+      // Network error: fall through to the backoff below.
+    }
+    if (disposed) return;
+
+    // Reset backoff if the connection was healthy (stayed up long enough).
+    if (DateTime.now().difference(start) > healthyAfter) {
+      attempt = 0;
+    } else {
+      attempt++;
+    }
+
+    final expMs = baseDelay.inMilliseconds * (1 << (attempt - 1).clamp(0, 10));
+    final cappedMs = expMs.clamp(0, maxDelay.inMilliseconds);
+    final jitter = cappedMs * (0.2 * (rand.nextDouble() * 2 - 1));
+    final delay = Duration(milliseconds: (cappedMs + jitter).round());
+    await Future<void>.delayed(delay);
+  }
 });
 
 /// One page of a subforum's threads. Family keyed by "slug:page".

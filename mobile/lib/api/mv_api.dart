@@ -1,11 +1,101 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:dio/dio.dart';
 import 'package:http/http.dart' as http;
 
 import '../core/config.dart';
 import 'models.dart';
+
+/// Retries transient backend failures (429 rate-limit, 503/connection/timeout)
+/// with exponential backoff + jitter, honoring `Retry-After` when present.
+///
+/// `validateStatus` is `s < 500`, so a 429 reaches us via [onResponse] (Dio
+/// treats it as a successful response) while a 503 / connection / timeout
+/// reaches us via [onError]. Both paths re-dispatch the original request.
+class _RetryInterceptor extends Interceptor {
+  _RetryInterceptor(this._dio);
+
+  final Dio _dio;
+  static const _maxRetries = 3;
+  static const _baseDelay = Duration(milliseconds: 500);
+  static final _rand = Random();
+
+  static const _attemptKey = '_retryAttempt';
+
+  int _attempt(RequestOptions o) => (o.extra[_attemptKey] as int?) ?? 0;
+
+  /// Exponential backoff (0.5s, 1s, 2s…) with ±20% jitter.
+  Duration _backoff(int attempt) {
+    final base = _baseDelay.inMilliseconds * (1 << attempt);
+    final jitter = base * (0.2 * (_rand.nextDouble() * 2 - 1));
+    return Duration(milliseconds: (base + jitter).round());
+  }
+
+  Duration? _retryAfter(Headers headers) {
+    final v = headers.value('retry-after');
+    if (v == null) return null;
+    final secs = int.tryParse(v.trim());
+    if (secs != null) return Duration(seconds: secs);
+    // HTTP-date form: fall back to a small fixed wait.
+    return const Duration(seconds: 2);
+  }
+
+  bool _retriable(int? status) => status == 429 || status == 503;
+
+  bool _retriableError(DioException e) {
+    if (_retriable(e.response?.statusCode)) return true;
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.connectionError:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  Future<Response<dynamic>> _redispatch(RequestOptions options, int attempt,
+      {Duration? retryAfter}) async {
+    await Future<void>.delayed(retryAfter ?? _backoff(attempt));
+    final next = options..extra[_attemptKey] = attempt + 1;
+    return _dio.fetch(next);
+  }
+
+  @override
+  void onResponse(Response response, ResponseInterceptorHandler handler) async {
+    final attempt = _attempt(response.requestOptions);
+    if (response.statusCode == 429 && attempt < _maxRetries) {
+      try {
+        final retried = await _redispatch(response.requestOptions, attempt,
+            retryAfter: _retryAfter(response.headers));
+        return handler.resolve(retried);
+      } catch (e) {
+        if (e is DioException) return handler.reject(e);
+        rethrow;
+      }
+    }
+    handler.next(response);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) async {
+    final attempt = _attempt(err.requestOptions);
+    if (attempt < _maxRetries && _retriableError(err)) {
+      try {
+        final retried = await _redispatch(err.requestOptions, attempt,
+            retryAfter: _retryAfter(err.response?.headers ?? Headers()));
+        return handler.resolve(retried);
+      } catch (e) {
+        if (e is DioException) return handler.reject(e);
+        rethrow;
+      }
+    }
+    handler.next(err);
+  }
+}
 
 enum AppLoginStatus { authenticated, guardRequired, failed }
 
@@ -46,6 +136,9 @@ class MvApi {
         handler.next(response);
       },
     ));
+    // Retry transient 429/503 (and connection/timeout) errors. Added after the
+    // 401 handler so a 401 still drops to login on the first response.
+    _dio.interceptors.add(_RetryInterceptor(_dio));
   }
 
   /// Invoked when the backend reports the session is gone (HTTP 401), so the
@@ -286,7 +379,24 @@ class MvApi {
 
   // --- notifications ---
 
-  Future<Bubbles> bubbles() async {
+  Future<Bubbles>? _bubblesInFlight;
+
+  /// Current notification counters. Truly-concurrent calls (a timer tick landing
+  /// on top of an SSE-triggered refresh, a tab switch, etc.) share one in-flight
+  /// GET /bubbles instead of each firing their own and amplifying load. A fresh
+  /// call started after the previous one settled still hits the network — this
+  /// only collapses overlap, it never serves a stale cached value.
+  Future<Bubbles> bubbles() {
+    final pending = _bubblesInFlight;
+    if (pending != null) return pending;
+    final fut = _fetchBubbles();
+    _bubblesInFlight = fut;
+    return fut.whenComplete(() {
+      if (identical(_bubblesInFlight, fut)) _bubblesInFlight = null;
+    });
+  }
+
+  Future<Bubbles> _fetchBubbles() async {
     final d = _obj(await _dio.get('/bubbles'));
     return Bubbles.fromJson(d);
   }
@@ -294,7 +404,13 @@ class MvApi {
   /// Live notification stream via Server-Sent Events (`GET /events`).
   /// EventSource can't set headers, so the token goes in the query string;
   /// the backend also accepts it there.
+  ///
+  /// An idle watchdog guards against half-open connections: the server sends a
+  /// `:` keepalive comment every ~25s, so if no line at all arrives within
+  /// [_sseIdleTimeout] the stream is treated as dead and closed, letting the
+  /// consumer loop exit and (upstream) reconnect.
   Stream<Bubbles> events() async* {
+    const sseIdleTimeout = Duration(seconds: 60);
     final uri = Uri.parse('$_baseUrl/events').replace(queryParameters: {
       'token': _token,
     });
@@ -308,20 +424,33 @@ class MvApi {
         if (resp.statusCode == 401) onUnauthorized?.call();
         throw MvApiException('events stream failed', resp.statusCode);
       }
-      String event = '';
-      await for (final line in resp.stream
+      // Any line (data, event, or `:` keepalive) resets the watchdog; firing it
+      // closes the client, which ends the `await for` below with an error we
+      // swallow so the stream completes cleanly.
+      final lines = resp.stream
           .transform(utf8.decoder)
-          .transform(const LineSplitter())) {
-        if (line.startsWith('event:')) {
-          event = line.substring(6).trim();
-        } else if (line.startsWith('data:')) {
-          final payload = line.substring(5).trim();
-          if (event == 'bubbles' && payload.isNotEmpty) {
-            try {
-              yield Bubbles.fromJson(jsonDecode(payload) as Map<String, dynamic>);
-            } catch (_) {}
+          .transform(const LineSplitter())
+          .timeout(sseIdleTimeout, onTimeout: (sink) {
+        sink.close();
+        client.close();
+      });
+      String event = '';
+      try {
+        await for (final line in lines) {
+          if (line.startsWith('event:')) {
+            event = line.substring(6).trim();
+          } else if (line.startsWith('data:')) {
+            final payload = line.substring(5).trim();
+            if (event == 'bubbles' && payload.isNotEmpty) {
+              try {
+                yield Bubbles.fromJson(jsonDecode(payload) as Map<String, dynamic>);
+              } catch (_) {}
+            }
           }
         }
+      } catch (_) {
+        // Connection dropped or idle-timeout closed the client mid-read; let the
+        // stream complete so the consumer can reconnect.
       }
     } finally {
       client.close();

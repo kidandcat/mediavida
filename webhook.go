@@ -77,6 +77,17 @@ func (ws *WebhookStore) Get(username string) string {
 	return ws.webhooks[username]
 }
 
+// Has reports whether a webhook is configured for the user (used by the poller
+// to decide whether anyone is listening). nil-safe.
+func (ws *WebhookStore) Has(username string) bool {
+	if ws == nil {
+		return false
+	}
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.webhooks[username] != ""
+}
+
 // WebhookPayload is the JSON body sent to the webhook URL.
 type WebhookPayload struct {
 	Username      string `json:"username"`

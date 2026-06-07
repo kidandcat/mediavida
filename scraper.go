@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -34,7 +35,7 @@ type ForumMessage struct {
 	Body     string // plain text (backward compatible)
 	BodyHTML string // rich inner HTML of .post-contents, URLs absolutized
 	Avatar   string // absolute avatar URL
-	Date      string // human date, e.g. "2/1/25 a las 16:37"
+	Date     string // human date, e.g. "2/1/25 a las 16:37"
 	Time     int64  // unix seconds, 0 if unknown
 	Num      int
 	Liked    bool // true if the current user has liked this post
@@ -52,18 +53,47 @@ func (e *ErrGuardRequired) Error() string {
 
 // ForumScraper handles login and thread scraping from Mediavida.
 type ForumScraper struct {
-	client       *http.Client
-	user         string
-	pass         string
+	client *http.Client
+	user   string
+	pass   string
+	// mu guards the mutable session/thread fields below (loggedIn, csrfToken,
+	// threadID, forumID, pageNum, threadURL) which are read/written concurrently
+	// by the bubbles poller and request handlers sharing the same clientID.
+	// The lock is NEVER held across a network call: writes wrap bare assignments,
+	// reads snapshot fields into locals before doing I/O.
+	mu           sync.RWMutex
 	loggedIn     bool
-	csrfToken    string // CSRF token from page, needed for post_mola and replies
-	threadID     string // numeric thread ID from page hidden input
-	forumID      string // forum ID from page hidden input #fid
-	pageNum      string // current page number from hidden input #pagina
-	threadURL    string // full thread URL for referer
-	clientID     string // for per-client session persistence
+	csrfToken    string    // CSRF token from page, needed for post_mola and replies
+	threadID     string    // numeric thread ID from page hidden input
+	forumID      string    // forum ID from page hidden input #fid
+	pageNum      string    // current page number from hidden input #pagina
+	threadURL    string    // full thread URL for referer
+	clientID     string    // for per-client session persistence
 	lastSaveTime time.Time // tracks last session save to avoid excessive writes
-	totpSecret   string // base32 TOTP secret for automatic guard verification
+	totpSecret   string    // base32 TOTP secret for automatic guard verification
+}
+
+// isLoggedIn reports the current login state under the read lock.
+func (s *ForumScraper) isLoggedIn() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.loggedIn
+}
+
+// setLoggedIn updates the login state under the write lock.
+func (s *ForumScraper) setLoggedIn(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loggedIn = v
+}
+
+// snapshotThread returns a consistent copy of the thread-related fields under
+// the read lock, so callers can build a request without holding the lock during
+// network I/O.
+func (s *ForumScraper) snapshotThread() (csrfToken, threadID, forumID, pageNum, threadURL string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.csrfToken, s.threadID, s.forumID, s.pageNum, s.threadURL
 }
 
 // utlsDialTLS dials a TLS connection using utls with a Chrome fingerprint.
@@ -230,7 +260,7 @@ func (s *ForumScraper) Login() error {
 		return fmt.Errorf("login failed: no session cookie received")
 	}
 
-	s.loggedIn = true
+	s.setLoggedIn(true)
 	log.Println("Logged in to Mediavida")
 	return nil
 }
@@ -280,7 +310,7 @@ func (s *ForumScraper) SubmitGuard(guardURL, code string) error {
 		return fmt.Errorf("verification failed: invalid code")
 	}
 
-	s.loggedIn = true
+	s.setLoggedIn(true)
 	log.Println("Guard verification successful, logged in")
 	return nil
 }
@@ -394,7 +424,7 @@ func (s *ForumScraper) LoadSession() bool {
 			return false
 		}
 		s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies) // safe-ignore: jar is always *cookiejar.Jar
-		s.loggedIn = true
+		s.setLoggedIn(true)
 		log.Printf("Session restored from disk (user: %s, %d cookies)", s.user, len(cookies))
 		return true
 	}
@@ -419,7 +449,7 @@ func (s *ForumScraper) LoadSession() bool {
 		})
 	}
 	s.client.Jar.(*cookiejar.Jar).SetCookies(u, cookies) // safe-ignore: jar is always *cookiejar.Jar
-	s.loggedIn = true
+	s.setLoggedIn(true)
 	log.Println("Session restored from disk (legacy format)")
 	return true
 }
@@ -427,7 +457,7 @@ func (s *ForumScraper) LoadSession() bool {
 // ClearSession removes the saved session file.
 func (s *ForumScraper) ClearSession() {
 	_ = os.Remove(sessionFile(s.clientID)) // safe-ignore: best-effort cleanup
-	s.loggedIn = false
+	s.setLoggedIn(false)
 	// Reset cookie jar so stale cookies don't interfere with re-login
 	jar, _ := cookiejar.New(nil) // safe-ignore: cookiejar.New(nil) never returns an error
 	s.client.Jar = jar
@@ -436,7 +466,7 @@ func (s *ForumScraper) ClearSession() {
 // ValidateSession checks if the current session is actually valid by making
 // a lightweight request to the bubbles endpoint.
 func (s *ForumScraper) ValidateSession() bool {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return false
 	}
 	req, err := http.NewRequest("GET", "https://www.mediavida.com/usuarios/action/bubbles.php", nil)
@@ -473,22 +503,23 @@ func (s *ForumScraper) ValidateSession() bool {
 
 // LikeMessage sends a "mano" (like) to a post via POST /foro/post_mola.php.
 func (s *ForumScraper) LikeMessage(postNum int) error {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		if err := s.Login(); err != nil {
 			return fmt.Errorf("login failed: %w", err)
 		}
 	}
 
-	if s.threadID == "" {
+	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
+	if threadID == "" {
 		return fmt.Errorf("no thread ID set")
 	}
-	if s.csrfToken == "" {
+	if csrfToken == "" {
 		return fmt.Errorf("no CSRF token available")
 	}
 
 	data := url.Values{
-		"token": {s.csrfToken},
-		"tid":   {s.threadID},
+		"token": {csrfToken},
+		"tid":   {threadID},
 		"num":   {strconv.Itoa(postNum)},
 		"undo":  {"false"},
 	}
@@ -501,7 +532,7 @@ func (s *ForumScraper) LikeMessage(postNum int) error {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
-	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Referer", threadURL)
 	req.Header.Set("Origin", "https://www.mediavida.com")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
@@ -518,23 +549,24 @@ func (s *ForumScraper) LikeMessage(postNum int) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("mola returned status %d: %s", resp.StatusCode, string(body))
 	}
-	log.Printf("Mano sent to post #%d (tid=%s, response: %s)", postNum, s.threadID, string(body))
+	log.Printf("Mano sent to post #%d (tid=%s, response: %s)", postNum, threadID, string(body))
 	return nil
 }
 
 // GetPostSource returns the raw (editable) source text of a post in the
 // last-read thread. Fetch the thread first so tid/token are set.
 func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return "", fmt.Errorf("not logged in")
 	}
-	if s.threadID == "" || s.csrfToken == "" {
+	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
+	if threadID == "" || csrfToken == "" {
 		return "", fmt.Errorf("no thread loaded; read the thread first")
 	}
 	data := url.Values{
-		"tid":   {s.threadID},
+		"tid":   {threadID},
 		"num":   {strconv.Itoa(postNum)},
-		"token": {s.csrfToken},
+		"token": {csrfToken},
 	}
 	req, err := http.NewRequest("POST", "https://www.mediavida.com/foro/post_contents.php", strings.NewReader(data.Encode()))
 	if err != nil {
@@ -543,7 +575,7 @@ func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Referer", threadURL)
 	req.Header.Set("Origin", "https://www.mediavida.com")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	resp, err := s.client.Do(req)
@@ -562,16 +594,17 @@ func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
 // as the web does when expanding a #NNNN reference (post_quote.php).
 // Returns the author and the rendered, URL-absolutized HTML body.
 func (s *ForumScraper) GetQuotedPost(postNum int) (author, bodyHTML string, err error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return "", "", fmt.Errorf("not logged in")
 	}
-	if s.threadID == "" || s.csrfToken == "" {
+	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
+	if threadID == "" || csrfToken == "" {
 		return "", "", fmt.Errorf("no thread loaded; read the thread first")
 	}
 	data := url.Values{
 		"num":   {strconv.Itoa(postNum)},
-		"tid":   {s.threadID},
-		"token": {s.csrfToken},
+		"tid":   {threadID},
+		"token": {csrfToken},
 	}
 	req, e := http.NewRequest("POST", "https://www.mediavida.com/foro/post_quote.php", strings.NewReader(data.Encode()))
 	if e != nil {
@@ -580,7 +613,7 @@ func (s *ForumScraper) GetQuotedPost(postNum int) (author, bodyHTML string, err 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Referer", threadURL)
 	req.Header.Set("Origin", "https://www.mediavida.com")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	resp, e := s.client.Do(req)
@@ -620,16 +653,17 @@ type QuotedReply struct {
 // GetPostQuoted fetches the posts that quote/reply to postNum in the current
 // thread (the web's "N respuestas" expander -> post_quoted.php). Read the thread first.
 func (s *ForumScraper) GetPostQuoted(postNum int) ([]QuotedReply, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
-	if s.threadID == "" || s.csrfToken == "" {
+	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
+	if threadID == "" || csrfToken == "" {
 		return nil, fmt.Errorf("no thread loaded; read the thread first")
 	}
 	data := url.Values{
 		"num":   {strconv.Itoa(postNum)},
-		"tid":   {s.threadID},
-		"token": {s.csrfToken},
+		"tid":   {threadID},
+		"token": {csrfToken},
 	}
 	req, e := http.NewRequest("POST", "https://www.mediavida.com/foro/post_quoted.php", strings.NewReader(data.Encode()))
 	if e != nil {
@@ -638,7 +672,7 @@ func (s *ForumScraper) GetPostQuoted(postNum int) ([]QuotedReply, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Referer", threadURL)
 	req.Header.Set("Origin", "https://www.mediavida.com")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	resp, e := s.client.Do(req)
@@ -713,17 +747,18 @@ func (s *ForumScraper) GetPostQuoted(postNum int) ([]QuotedReply, error) {
 // EditMessage edits an existing post in the last-read thread (poster.php with a
 // num parameter edits instead of creating a new reply). Fetch the thread first.
 func (s *ForumScraper) EditMessage(postNum int, text string) error {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return fmt.Errorf("not logged in")
 	}
-	if s.threadID == "" || s.csrfToken == "" {
+	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
+	if threadID == "" || csrfToken == "" {
 		return fmt.Errorf("no thread loaded; read the thread first")
 	}
 	data := url.Values{
 		"cuerpo": {text},
-		"tid":    {s.threadID},
+		"tid":    {threadID},
 		"num":    {strconv.Itoa(postNum)},
-		"token":  {s.csrfToken},
+		"token":  {csrfToken},
 	}
 	req, err := http.NewRequest("POST", "https://www.mediavida.com/foro/action/poster.php", strings.NewReader(data.Encode()))
 	if err != nil {
@@ -732,7 +767,7 @@ func (s *ForumScraper) EditMessage(postNum int, text string) error {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Referer", threadURL)
 	req.Header.Set("Origin", "https://www.mediavida.com")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	resp, err := s.client.Do(req)
@@ -754,13 +789,13 @@ func (s *ForumScraper) EditMessage(postNum int, text string) error {
 	return nil
 }
 
-
 // PostReply posts a reply to the current thread. If replyToNum > 0, prepends #NUM to reference that post.
 func (s *ForumScraper) PostReply(text string, replyToNum int) error {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return fmt.Errorf("not logged in")
 	}
-	if s.csrfToken == "" || s.threadID == "" || s.forumID == "" {
+	csrfToken, threadID, forumID, pageNum, threadURL := s.snapshotThread()
+	if csrfToken == "" || threadID == "" || forumID == "" {
 		return fmt.Errorf("missing thread metadata (token/tid/fid)")
 	}
 
@@ -770,11 +805,11 @@ func (s *ForumScraper) PostReply(text string, replyToNum int) error {
 	}
 
 	data := url.Values{
-		"token":    {s.csrfToken},
+		"token":    {csrfToken},
 		"cabecera": {""},
-		"fid":      {s.forumID},
-		"tid":      {s.threadID},
-		"pagina":   {s.pageNum},
+		"fid":      {forumID},
+		"tid":      {threadID},
+		"pagina":   {pageNum},
 		"cuerpo":   {body},
 	}
 
@@ -787,7 +822,7 @@ func (s *ForumScraper) PostReply(text string, replyToNum int) error {
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
 	req.Header.Set("Origin", "https://www.mediavida.com")
-	req.Header.Set("Referer", s.threadURL)
+	req.Header.Set("Referer", threadURL)
 	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
 	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
@@ -951,7 +986,7 @@ func parseThreadList(doc *goquery.Document) []ThreadListItem {
 
 // FetchFavorites returns the user's favorite threads.
 func (s *ForumScraper) FetchFavorites() ([]ThreadListItem, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 	resp, err := s.doGet("https://www.mediavida.com/foro/favoritos")
@@ -1046,7 +1081,7 @@ func (s *ForumScraper) FetchFavorites() ([]ThreadListItem, error) {
 
 // FetchUserPosts returns threads where the given user has posted.
 func (s *ForumScraper) FetchUserPosts(username string) ([]ThreadListItem, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 	resp, err := s.doGet(fmt.Sprintf("https://www.mediavida.com/id/%s/posts", username))
@@ -1073,7 +1108,7 @@ type MentionItem struct {
 
 // FetchMentions returns recent mentions of the given user.
 func (s *ForumScraper) FetchMentions(username string) ([]MentionItem, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 	resp, err := s.doGet(fmt.Sprintf("https://www.mediavida.com/id/%s/menciones", username))
@@ -1129,7 +1164,7 @@ type NotificationItem struct {
 // all notifications as seen server-side (Mediavida has no per-item mark), so the
 // bn bubble drops to 0 after this call.
 func (s *ForumScraper) FetchNotifications() ([]NotificationItem, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, &ErrSessionExpired{}
 	}
 	resp, err := s.doGet("https://www.mediavida.com/notificaciones")
@@ -1178,7 +1213,7 @@ func (e *ErrSessionExpired) Error() string {
 
 // FetchBubbles polls the lightweight notification endpoint to check for new activity.
 func (s *ForumScraper) FetchBubbles() (*Bubbles, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 
@@ -1218,7 +1253,7 @@ func (s *ForumScraper) FetchBubbles() (*Bubbles, error) {
 	// Non-JSON response (HTML) means Cloudflare blocked us or session expired
 	trimmed := strings.TrimSpace(string(body))
 	if len(trimmed) == 0 || trimmed[0] == '<' {
-		s.loggedIn = false
+		s.setLoggedIn(false)
 		return nil, &ErrSessionExpired{}
 	}
 
@@ -1232,7 +1267,7 @@ func (s *ForumScraper) FetchBubbles() (*Bubbles, error) {
 		}
 		// Empty array [] also means not logged in
 		if len(arr) == 0 {
-			s.loggedIn = false
+			s.setLoggedIn(false)
 			return nil, &ErrSessionExpired{}
 		}
 		if len(arr) >= 3 {
@@ -1254,7 +1289,7 @@ type ModBubbles struct {
 // counters (Reportes (N), Mensajes (N)). Returns nil with no error if the user
 // is not a mod of the given subforum (no dropdown present).
 func (s *ForumScraper) FetchModBubbles(forumSlug string) (*ModBubbles, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 
@@ -1325,7 +1360,7 @@ func (r *ModReport) Key() string {
 // FetchModReports fetches /foro/reportes.php?fid=X and returns the list of
 // pending reports with full detail.
 func (s *ForumScraper) FetchModReports(fid string) ([]ModReport, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 	if fid == "" {
@@ -1439,7 +1474,7 @@ func extractFid(href string) string {
 // RefreshSession visits the main page to keep the session alive, mimicking browser navigation.
 // This causes the server to send fresh Set-Cookie headers, extending session lifetime.
 func (s *ForumScraper) RefreshSession() error {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return fmt.Errorf("not logged in")
 	}
 	resp, err := s.doGet("https://www.mediavida.com/")
@@ -1504,7 +1539,7 @@ func (s *ForumScraper) Relogin() error {
 
 // IsLoggedIn returns whether the scraper believes it has an active session.
 func (s *ForumScraper) IsLoggedIn() bool {
-	return s.loggedIn
+	return s.isLoggedIn()
 }
 
 // InboxItem represents a conversation in the private messages inbox.
@@ -1518,7 +1553,7 @@ type InboxItem struct {
 
 // FetchInbox returns the list of private message conversations.
 func (s *ForumScraper) FetchInbox(page int) ([]InboxItem, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 	if page <= 0 {
@@ -1593,7 +1628,7 @@ type Conversation struct {
 
 // FetchConversation reads a private message conversation by its ID.
 func (s *ForumScraper) FetchConversation(id string) (*Conversation, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 
@@ -1665,7 +1700,7 @@ func (s *ForumScraper) FetchConversation(id string) (*Conversation, error) {
 // It re-reads the conversation page to obtain a fresh CSRF token + thread id,
 // then submits the message form (POST /msg/pm_action.php).
 func (s *ForumScraper) SendPrivateMessage(conversationID, text string) error {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return fmt.Errorf("not logged in")
 	}
 	text = strings.TrimSpace(text)
@@ -1743,7 +1778,7 @@ type NewThreadPage struct {
 
 // FetchNewThreadPage visits the new thread form for a subforum and extracts the CSRF token, forum ID, and available tags.
 func (s *ForumScraper) FetchNewThreadPage(subforum string) (*NewThreadPage, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
 	}
 
@@ -1786,7 +1821,7 @@ func (s *ForumScraper) FetchNewThreadPage(subforum string) (*NewThreadPage, erro
 
 // CreateThread creates a new thread in the specified subforum via acciones_preview.php.
 func (s *ForumScraper) CreateThread(subforum, title, body string, tag int, addToFav bool) (string, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		return "", fmt.Errorf("not logged in")
 	}
 
@@ -1883,13 +1918,15 @@ func threadPageURL(threadURL string, page int) string {
 }
 
 func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, error) {
-	if !s.loggedIn {
+	if !s.isLoggedIn() {
 		if err := s.Login(); err != nil {
 			return nil, fmt.Errorf("login failed: %w", err)
 		}
 	}
 
+	s.mu.Lock()
 	s.threadURL = threadURL
+	s.mu.Unlock()
 
 	// First fetch page 1 to discover total pages
 	resp, err := s.doGet(threadPageURL(threadURL, 1))
@@ -1939,19 +1976,33 @@ func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, err
 
 // extractMetadata pulls thread ID, CSRF token, forum ID, and page number from the document.
 func (s *ForumScraper) extractMetadata(doc *goquery.Document) {
-	if tid := doc.Find("#tid").AttrOr("value", ""); tid != "" {
+	// Parse the values outside the lock (DOM access is read-only), then commit
+	// the assignments under a single write lock.
+	tid := doc.Find("#tid").AttrOr("value", "")
+	token := doc.Find("#token").AttrOr("value", "")
+	fid := doc.Find("#fid").AttrOr("value", "")
+	pagina := doc.Find("#pagina").AttrOr("value", "")
+
+	s.mu.Lock()
+	if tid != "" {
 		s.threadID = tid
-		log.Printf("Thread ID: %s", tid)
 	}
-	if token := doc.Find("#token").AttrOr("value", ""); token != "" {
+	if token != "" {
 		s.csrfToken = token
-		log.Printf("CSRF token: %s...%s", token[:min(6, len(token))], token[max(0, len(token)-6):])
 	}
-	if fid := doc.Find("#fid").AttrOr("value", ""); fid != "" {
+	if fid != "" {
 		s.forumID = fid
 	}
-	if pagina := doc.Find("#pagina").AttrOr("value", ""); pagina != "" {
+	if pagina != "" {
 		s.pageNum = pagina
+	}
+	s.mu.Unlock()
+
+	if tid != "" {
+		log.Printf("Thread ID: %s", tid)
+	}
+	if token != "" {
+		log.Printf("CSRF token: %s...%s", token[:min(6, len(token))], token[max(0, len(token)-6):])
 	}
 }
 

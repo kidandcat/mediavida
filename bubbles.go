@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +15,28 @@ const (
 	pollInterval  = 30 * time.Second
 	saveEveryN    = 20 // save session to disk every N polls (~10 min at 30s interval)
 	refreshEveryN = 10 // refresh session via main page every N polls (~5 min at 30s interval)
+
+	pollWorkers     = 16 // concurrent per-session scrapes per tick (was a single serial loop)
+	breakerMaxSkip  = 16 // max consecutive ticks a failing session is skipped (~8 min)
+	pushQueueSize   = 4096
+	pushWorkers     = 8
 )
+
+// breakerState backs off a session that keeps failing so a banned/slow endpoint
+// doesn't get hammered and doesn't block a worker every tick.
+type breakerState struct {
+	fails int // consecutive failures
+	skip  int // remaining ticks to skip before retrying
+}
+
+// pushJob carries a computed bubble increase out of the poll loop to the async
+// push workers (so a slow FCM/webhook endpoint never freezes the poll cycle).
+type pushJob struct {
+	clientID string
+	username string
+	prev     *Bubbles
+	current  *Bubbles
+}
 
 // BubblesPoller polls bubbles.php for each authenticated session and broadcasts
 // changes via the EventHub (SSE) and configured outgoing webhooks.
@@ -27,13 +49,22 @@ type BubblesPoller struct {
 	fcm       *FCMSender      // FCM push (nil when not configured)
 	modForums *ModForumsStore // per-mv-user subforum subscriptions
 
-	mu             sync.Mutex
-	stopCh         chan struct{}
+	mu     sync.Mutex
+	stopCh chan struct{}
+
+	// state mutated by concurrent poll workers — all guarded by stateMu.
+	stateMu        sync.Mutex
+	modMu          sync.Mutex // serializes checkMod (rare mod users) so its maps stay race-free
 	prev           map[string]*Bubbles                       // clientID → last known bubbles
 	prevMod        map[string]map[string]*ModBubbles         // clientID → slug → last mod counters
 	prevReports    map[string]map[string]map[string]struct{} // clientID → slug → set of report keys
+	breaker        map[string]*breakerState                  // clientID → failure backoff
+	gated          map[string]bool                           // clientID → was skipped last cycle (re-baseline on resume)
 	saveCounter    int                                       // counts polls to periodically save sessions
 	refreshCounter int                                       // counts polls to periodically refresh sessions via main page
+
+	pushCh chan pushJob
+	pushWG sync.WaitGroup
 }
 
 func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, ntfy *NtfyPublisher, fcm *FCMSender, modForums *ModForumsStore) *BubblesPoller {
@@ -49,6 +80,8 @@ func NewBubblesPoller(hub *EventHub, sessions *SessionStore, webhooks *WebhookSt
 		prev:        make(map[string]*Bubbles),
 		prevMod:     prevMod,
 		prevReports: prevReports,
+		breaker:     make(map[string]*breakerState),
+		gated:       make(map[string]bool),
 	}
 }
 
@@ -70,38 +103,96 @@ func (bp *BubblesPoller) Start() {
 		return
 	}
 	bp.stopCh = make(chan struct{})
-	go bp.poll()              // goroutine-ok: long-lived background poller, lives for the process lifetime (stopped via stopCh)
-	go bp.dailySummaryLoop()  // goroutine-ok: long-lived background loop, lives for the process lifetime (stopped via stopCh)
+	bp.pushCh = make(chan pushJob, pushQueueSize)
+	for i := 0; i < pushWorkers; i++ {
+		bp.pushWG.Add(1)
+		go bp.pushWorker() // goroutine-ok: async push worker, drained on Stop via pushWG
+	}
+	go bp.poll()             // goroutine-ok: long-lived background poller, lives for the process lifetime (stopped via stopCh)
+	go bp.dailySummaryLoop() // goroutine-ok: long-lived background loop, lives for the process lifetime (stopped via stopCh)
 }
 
-// Stop stops the polling goroutine.
+// Stop stops the polling goroutine and drains the async push workers.
 func (bp *BubblesPoller) Stop() {
 	bp.mu.Lock()
-	defer bp.mu.Unlock()
+	if bp.stopCh == nil {
+		bp.mu.Unlock()
+		return
+	}
+	close(bp.stopCh)
+	bp.stopCh = nil
+	pushCh := bp.pushCh
+	bp.pushCh = nil
+	bp.mu.Unlock()
 
-	if bp.stopCh != nil {
-		close(bp.stopCh)
-		bp.stopCh = nil
+	// Close the push queue and wait for in-flight pushes to flush.
+	if pushCh != nil {
+		close(pushCh)
+		bp.pushWG.Wait()
 	}
 }
 
-func (bp *BubblesPoller) poll() {
-	log.Printf("[bubbles] polling started (every %s)", pollInterval)
+// pushWorker drains async push jobs (webhook / ntfy / FCM) off the poll loop so
+// a slow endpoint can never freeze the poll cycle. The prev/current snapshot is
+// carried with the job (not re-read) to avoid out-of-order/stale counts.
+func (bp *BubblesPoller) pushWorker() {
+	defer bp.pushWG.Done()
+	for job := range bp.pushCh {
+		bp.webhooks.Send(job.username, job.current)
+		bp.ntfy.NotifyBubbleIncrease(job.clientID, job.prev, job.current)
+		bp.fcm.NotifyBubbleIncrease(job.clientID, job.prev, job.current)
+	}
+}
 
-	// Establish baseline for existing sessions
+// enqueuePush submits a push job, dropping it if the queue is full (push is
+// best-effort; the next change will re-notify) so the poller never blocks.
+func (bp *BubblesPoller) enqueuePush(job pushJob) {
+	bp.mu.Lock()
+	ch := bp.pushCh
+	bp.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- job:
+	default:
+		log.Printf("[bubbles] push queue full, dropping notification for %s", job.username)
+	}
+}
+
+// sessionRef is a snapshot entry so workers scrape without holding the
+// SessionStore lock across the network call.
+type sessionRef struct {
+	clientID string
+	s        *Session
+}
+
+// authedSessions snapshots the currently-authenticated sessions under the store
+// lock, so the poll workers can run lock-free.
+func (bp *BubblesPoller) authedSessions() []sessionRef {
+	var list []sessionRef
 	bp.sessions.ForEach(func(clientID string, s *Session) {
-		if s.Status != "authenticated" || s.Scraper == nil {
-			return
-		}
-		prev, err := s.Scraper.FetchBubbles()
-		if err != nil {
-			log.Printf("[bubbles] initial fetch failed for %s: %v", s.Scraper.Username(), err)
-			bp.prev[clientID] = &Bubbles{}
-		} else {
-			bp.prev[clientID] = prev
-			log.Printf("[bubbles] baseline (%s): bm=%d bn=%d bf=%d", s.Scraper.Username(), prev.Messages, prev.Notifications, prev.Favorites)
+		if s.Status == "authenticated" && s.Scraper != nil {
+			list = append(list, sessionRef{clientID, s})
 		}
 	})
+	return list
+}
+
+func (bp *BubblesPoller) poll() {
+	log.Printf("[bubbles] polling started (every %s, %d workers)", pollInterval, pollWorkers)
+
+	// Establish baseline for existing sessions (serial; one-time at startup).
+	for _, sr := range bp.authedSessions() {
+		current, err := sr.s.Scraper.FetchBubbles()
+		bp.stateMu.Lock()
+		if err != nil {
+			bp.prev[sr.clientID] = &Bubbles{}
+		} else {
+			bp.prev[sr.clientID] = current
+		}
+		bp.stateMu.Unlock()
+	}
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -117,89 +208,174 @@ func (bp *BubblesPoller) poll() {
 	}
 }
 
+// check fans the per-session work out over a bounded worker pool so one slow
+// scrape no longer blocks every other session (the serial loop saturated at
+// ~200-300 sessions).
 func (bp *BubblesPoller) check() {
-	// Increment counters once per tick (not per session) to keep intervals predictable
+	// Counters advance once per tick (not per session) to keep intervals predictable.
 	bp.saveCounter++
 	bp.refreshCounter++
+	save := bp.saveCounter%saveEveryN == 0
+	refresh := bp.refreshCounter%refreshEveryN == 0
 
-	bp.sessions.ForEach(func(clientID string, s *Session) {
-		if s.Status != "authenticated" || s.Scraper == nil {
-			return
-		}
-
-		// Periodically save session to keep cookies on disk fresh.
-		// Runs regardless of whether FetchBubbles succeeds.
-		if bp.saveCounter%saveEveryN == 0 {
-			s.Scraper.SaveSession()
-		}
-
-		// Periodically refresh session by visiting main page (like a browser would).
-		// Runs regardless of whether FetchBubbles succeeds.
-		if bp.refreshCounter%refreshEveryN == 0 {
-			if err := s.Scraper.RefreshSession(); err != nil {
-				log.Printf("[bubbles] session refresh failed for %s: %v", s.Scraper.Username(), err)
-			} else {
-				s.Scraper.SaveSession()
-				log.Printf("[bubbles] session refreshed and saved for %s", s.Scraper.Username())
+	list := bp.authedSessions()
+	jobs := make(chan sessionRef)
+	var wg sync.WaitGroup
+	for i := 0; i < pollWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sr := range jobs {
+				bp.checkOne(sr.clientID, sr.s, save, refresh)
 			}
-		}
+		}()
+	}
+	for _, sr := range list {
+		jobs <- sr
+	}
+	close(jobs)
+	wg.Wait()
+}
 
-		current, err := s.Scraper.FetchBubbles()
-		if err != nil {
-			var expired *ErrSessionExpired
-			if errors.As(err, &expired) || !s.Scraper.IsLoggedIn() {
-				log.Printf("[bubbles] session invalid for %s, attempting re-login", s.Scraper.Username())
-				if rerr := s.Scraper.Relogin(); rerr != nil {
-					log.Printf("[bubbles] re-login failed for %s: %v", s.Scraper.Username(), rerr)
-					// Notify via webhook that re-auth is needed
-					var guardErr *ErrGuardRequired
-					if errors.As(rerr, &guardErr) {
-						bp.webhooks.Send(s.Scraper.Username(), &Bubbles{Messages: -1, Notifications: -1, Favorites: -1})
-					}
-					return
+// checkOne polls one session: honors the per-session circuit breaker, runs the
+// periodic save/refresh, gates the scrape on whether anyone is listening, diffs
+// the counters and enqueues push asynchronously.
+func (bp *BubblesPoller) checkOne(clientID string, s *Session, save, refresh bool) {
+	scraper := s.Scraper
+	username := scraper.Username()
+
+	// Circuit breaker: skip a failing session for its backoff window.
+	bp.stateMu.Lock()
+	if br := bp.breaker[clientID]; br != nil && br.skip > 0 {
+		br.skip--
+		bp.stateMu.Unlock()
+		return
+	}
+	bp.stateMu.Unlock()
+
+	// Periodic cookie save/refresh runs even when gated, so idle sessions don't rot.
+	if save {
+		scraper.SaveSession()
+	}
+	if refresh {
+		if err := scraper.RefreshSession(); err != nil {
+			log.Printf("[bubbles] session refresh failed for %s: %v", username, err)
+		} else {
+			scraper.SaveSession()
+		}
+	}
+
+	// Gate: if nobody is listening (no SSE, no FCM token, no webhook) skip the
+	// bubble scrape — the biggest idle-load reduction. Mark gated so we
+	// re-baseline (no spurious "increase") when the session resumes.
+	if !bp.shouldPoll(clientID, username) {
+		bp.stateMu.Lock()
+		bp.gated[clientID] = true
+		bp.stateMu.Unlock()
+		return
+	}
+
+	// Per-session jitter to desync workers within the tick (thundering-herd avoidance).
+	time.Sleep(time.Duration(rand.Int63n(int64(2 * time.Second))))
+
+	current, err := scraper.FetchBubbles()
+	if err != nil {
+		var expired *ErrSessionExpired
+		if errors.As(err, &expired) || !scraper.IsLoggedIn() {
+			log.Printf("[bubbles] session invalid for %s, attempting re-login", username)
+			if rerr := scraper.Relogin(); rerr != nil {
+				var guardErr *ErrGuardRequired
+				if errors.As(rerr, &guardErr) {
+					bp.webhooks.Send(username, &Bubbles{Messages: -1, Notifications: -1, Favorites: -1})
 				}
-				current, err = s.Scraper.FetchBubbles()
-				if err != nil {
-					log.Printf("[bubbles] fetch error after re-login (%s): %v", s.Scraper.Username(), err)
-					return
-				}
-			} else {
-				log.Printf("[bubbles] fetch error (%s): %v", s.Scraper.Username(), err)
+				bp.recordFailure(clientID)
 				return
 			}
+			current, err = scraper.FetchBubbles()
 		}
-
-		prev := bp.prev[clientID]
-		if prev == nil {
-			bp.prev[clientID] = current
-			log.Printf("[bubbles] baseline set (%s): bm=%d bn=%d bf=%d", s.Scraper.Username(), current.Messages, current.Notifications, current.Favorites)
+		if err != nil {
+			log.Printf("[bubbles] fetch error (%s): %v", username, err)
+			bp.recordFailure(clientID)
 			return
 		}
+	}
+	bp.recordSuccess(clientID)
 
-		changed := current.Notifications != prev.Notifications ||
-			current.Messages != prev.Messages ||
-			current.Favorites != prev.Favorites
-
-		if changed {
-			log.Printf("[bubbles] changed (%s): bm=%d→%d bn=%d→%d bf=%d→%d",
-				s.Scraper.Username(),
-				prev.Messages, current.Messages,
-				prev.Notifications, current.Notifications,
-				prev.Favorites, current.Favorites)
-
-			bp.notifyClient(clientID, current)
-			bp.webhooks.Send(s.Scraper.Username(), current)
-			// Push only the counters that went up (new activity); never on reads.
-			bp.ntfy.NotifyBubbleIncrease(clientID, prev, current)
-			bp.fcm.NotifyBubbleIncrease(clientID, prev, current)
-			// Save session after change to persist any refreshed cookies
-			s.Scraper.SaveSession()
-		}
-
+	bp.stateMu.Lock()
+	wasGated := bp.gated[clientID]
+	delete(bp.gated, clientID)
+	prev := bp.prev[clientID]
+	if prev == nil || wasGated {
+		// First sight or just resumed after gating → (re)baseline, no notify.
 		bp.prev[clientID] = current
+		bp.stateMu.Unlock()
+		bp.runCheckMod(clientID, s)
+		return
+	}
+	changed := current.Notifications != prev.Notifications ||
+		current.Messages != prev.Messages ||
+		current.Favorites != prev.Favorites
+	bp.prev[clientID] = current
+	bp.stateMu.Unlock()
 
-		bp.checkMod(clientID, s)
-	})
+	if changed {
+		log.Printf("[bubbles] changed (%s): bm=%d→%d bn=%d→%d bf=%d→%d", username,
+			prev.Messages, current.Messages,
+			prev.Notifications, current.Notifications,
+			prev.Favorites, current.Favorites)
+		bp.notifyClient(clientID, current) // SSE — in-process, fast
+		scraper.SaveSession()
+		// webhook/ntfy/fcm go async with the prev/current snapshot carried along.
+		bp.enqueuePush(pushJob{clientID: clientID, username: username, prev: prev, current: current})
+	}
+
+	bp.runCheckMod(clientID, s)
+}
+
+// runCheckMod serializes the mod-tracking work (rare mod users) so its maps stay
+// race-free under the concurrent worker pool.
+func (bp *BubblesPoller) runCheckMod(clientID string, s *Session) {
+	if bp.telegram == nil {
+		return
+	}
+	bp.modMu.Lock()
+	defer bp.modMu.Unlock()
+	bp.checkMod(clientID, s)
+}
+
+func (bp *BubblesPoller) recordFailure(clientID string) {
+	bp.stateMu.Lock()
+	defer bp.stateMu.Unlock()
+	br := bp.breaker[clientID]
+	if br == nil {
+		br = &breakerState{}
+		bp.breaker[clientID] = br
+	}
+	br.fails++
+	skip := 1 << min(br.fails, 4) // 2, 4, 8, 16 ticks
+	if skip > breakerMaxSkip {
+		skip = breakerMaxSkip
+	}
+	br.skip = skip
+}
+
+func (bp *BubblesPoller) recordSuccess(clientID string) {
+	bp.stateMu.Lock()
+	defer bp.stateMu.Unlock()
+	if br := bp.breaker[clientID]; br != nil {
+		br.fails = 0
+		br.skip = 0
+	}
+}
+
+// shouldPoll reports whether anyone is listening for this client's bubbles: an
+// SSE subscriber, a registered FCM token, or a webhook. If none, the scrape is
+// skipped (gated) — this preserves app-closed FCM/ntfy/webhook push, which is
+// the whole reason to keep polling without an SSE subscriber.
+func (bp *BubblesPoller) shouldPoll(clientID, username string) bool {
+	return bp.hub.HasSubscribers(clientID) ||
+		bp.fcm.HasTokens(clientID) ||
+		bp.webhooks.Has(username)
 }
 
 // checkMod polls the subforums this user subscribed to via /mod/forums and

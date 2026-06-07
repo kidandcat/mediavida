@@ -34,8 +34,21 @@ func NewSessionStore(cs *ColmenaStore) *SessionStore {
 // Get returns a session by client ID.
 func (ss *SessionStore) Get(clientID string) *Session {
 	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	return ss.sessions[clientID]
+	s := ss.sessions[clientID]
+	ss.mu.RUnlock()
+	if s != nil {
+		return s
+	}
+	// Multi-node cluster: the session may have been created on another node and
+	// only live in Raft (this node's in-memory map is per-process). Lazily
+	// rehydrate from Colmena so any node can serve any device — without this, a
+	// login on node A followed by a request routed to node B looks unauthenticated.
+	if ss.RestoreSession(clientID) {
+		ss.mu.RLock()
+		s = ss.sessions[clientID]
+		ss.mu.RUnlock()
+	}
+	return s
 }
 
 // Set stores a session for a client ID.

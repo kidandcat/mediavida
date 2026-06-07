@@ -620,6 +620,50 @@ class _PostCardState extends State<_PostCard> {
     }
   }
 
+  /// Renders the post body, inserting each expanded reference (#NNNN) right
+  /// below its own `#ID` link — like the web — instead of all at the bottom.
+  /// It splits the HTML immediately after the ref's `<a>…</a>` so the quote
+  /// lands between the id and the rest of the message. With nothing expanded it
+  /// renders the whole body as a single widget (no splitting, no behavior change).
+  List<Widget> _buildBodyWithRefs(String bodyHtml) {
+    if (_refs.isEmpty) {
+      return [PostHtml(bodyHtml, onPostRef: _toggleRef)];
+    }
+    // Drop a unique marker right after each expanded reference's <a>…</a>.
+    var html = bodyHtml;
+    for (final num in _refs.keys) {
+      final re = RegExp('(<a\\b[^>]*#$num"[^>]*>.*?</a>)', dotAll: true);
+      html = html.replaceFirstMapped(re, (m) => '${m.group(1)}@@mvref:$num@@');
+    }
+    final widgets = <Widget>[];
+    final emitted = <int>{};
+    final marker = RegExp(r'@@mvref:(\d+)@@');
+    var last = 0;
+    for (final m in marker.allMatches(html)) {
+      final chunk = html.substring(last, m.start);
+      if (chunk.trim().isNotEmpty) widgets.add(PostHtml(chunk, onPostRef: _toggleRef));
+      final num = int.parse(m.group(1)!);
+      widgets.add(_refBox(num));
+      emitted.add(num);
+      last = m.end;
+    }
+    final tail = html.substring(last);
+    if (tail.trim().isNotEmpty) widgets.add(PostHtml(tail, onPostRef: _toggleRef));
+    // Refs whose <a> wasn't found in the body fall back to the bottom.
+    for (final num in _refs.keys) {
+      if (!emitted.contains(num)) widgets.add(_refBox(num));
+    }
+    return widgets;
+  }
+
+  Widget _refBox(int num) => _RefBox(
+        num: num,
+        content: _refs[num],
+        loading: _loading.contains(num),
+        onClose: () => _toggleRef(num),
+        onRefTap: _toggleRef,
+      );
+
   Future<void> _toggleRef(int num) async {
     if (_refs.containsKey(num)) {
       setState(() => _refs.remove(num)); // collapse
@@ -676,18 +720,10 @@ class _PostCardState extends State<_PostCard> {
               ],
             ),
             const SizedBox(height: 10),
-            post.bodyHtml.trim().isNotEmpty
-                ? PostHtml(post.bodyHtml, onPostRef: _toggleRef)
-                : Text(post.body, style: const TextStyle(fontSize: 15, height: 1.45)),
-            // Inline-expanded references appear right below the body, like the web.
-            for (final num in _refs.keys)
-              _RefBox(
-                num: num,
-                content: _refs[num],
-                loading: _loading.contains(num),
-                onClose: () => _toggleRef(num),
-                onRefTap: _toggleRef,
-              ),
+            if (post.bodyHtml.trim().isNotEmpty)
+              ..._buildBodyWithRefs(post.bodyHtml)
+            else
+              Text(post.body, style: const TextStyle(fontSize: 15, height: 1.45)),
             // "N respuestas": forward-quote replies expanded inline, like the web.
             if (post.replies > 0) ...[
               const SizedBox(height: 6),

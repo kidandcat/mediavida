@@ -106,6 +106,24 @@ func (s *ForumScraper) snapshotThread() (csrfToken, threadID, forumID, pageNum, 
 	return s.csrfToken, s.threadID, s.forumID, s.pageNum, s.threadURL
 }
 
+// ensureThread makes the given thread the current one before a thread-scoped
+// action (reply/like/edit). If wantURL is empty it is a no-op (callers that
+// already loaded the thread). If it differs from the synced thread, the thread
+// is re-fetched so tid/token/fid match wantURL — this is what keeps a write from
+// landing in a previously-viewed thread when the backend state is stale.
+func (s *ForumScraper) ensureThread(wantURL string) error {
+	if wantURL == "" {
+		return nil
+	}
+	if _, _, _, _, cur := s.snapshotThread(); cur == wantURL {
+		return nil
+	}
+	if _, err := s.FetchThread(wantURL, 0); err != nil {
+		return fmt.Errorf("failed to sync thread %q: %w", wantURL, err)
+	}
+	return nil
+}
+
 // utlsDialTLS dials a TLS connection using utls with a Chrome fingerprint.
 func utlsDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
@@ -566,11 +584,15 @@ func (s *ForumScraper) ValidateSession() bool {
 }
 
 // LikeMessage sends a "mano" (like) to a post via POST /foro/post_mola.php.
-func (s *ForumScraper) LikeMessage(postNum int) error {
+// wantURL, if set, ensures the like lands in that thread even if backend state is stale.
+func (s *ForumScraper) LikeMessage(postNum int, wantURL string) error {
 	if !s.isLoggedIn() {
 		if err := s.Login(); err != nil {
 			return fmt.Errorf("login failed: %w", err)
 		}
+	}
+	if err := s.ensureThread(wantURL); err != nil {
+		return err
 	}
 
 	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
@@ -810,9 +832,12 @@ func (s *ForumScraper) GetPostQuoted(postNum int) ([]QuotedReply, error) {
 
 // EditMessage edits an existing post in the last-read thread (poster.php with a
 // num parameter edits instead of creating a new reply). Fetch the thread first.
-func (s *ForumScraper) EditMessage(postNum int, text string) error {
+func (s *ForumScraper) EditMessage(postNum int, text string, wantURL string) error {
 	if !s.isLoggedIn() {
 		return fmt.Errorf("not logged in")
+	}
+	if err := s.ensureThread(wantURL); err != nil {
+		return err
 	}
 	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
 	if threadID == "" || csrfToken == "" {
@@ -854,9 +879,14 @@ func (s *ForumScraper) EditMessage(postNum int, text string) error {
 }
 
 // PostReply posts a reply to the current thread. If replyToNum > 0, prepends #NUM to reference that post.
-func (s *ForumScraper) PostReply(text string, replyToNum int) error {
+// If wantURL is non-empty and differs from the currently-synced thread, the thread is re-fetched first
+// so the reply always lands in the thread the caller intends, regardless of stale backend state.
+func (s *ForumScraper) PostReply(text string, replyToNum int, wantURL string) error {
 	if !s.isLoggedIn() {
 		return fmt.Errorf("not logged in")
+	}
+	if err := s.ensureThread(wantURL); err != nil {
+		return err
 	}
 	csrfToken, threadID, forumID, pageNum, threadURL := s.snapshotThread()
 	if csrfToken == "" || threadID == "" || forumID == "" {
@@ -1988,10 +2018,6 @@ func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, err
 		}
 	}
 
-	s.mu.Lock()
-	s.threadURL = threadURL
-	s.mu.Unlock()
-
 	// First fetch page 1 to discover total pages
 	resp, err := s.doGet(threadPageURL(threadURL, 1))
 	if err != nil {
@@ -2005,6 +2031,14 @@ func (s *ForumScraper) FetchThread(threadURL string, page int) (*ThreadPage, err
 	}
 
 	s.extractMetadata(doc)
+
+	// Publish threadURL only after the rest of the metadata (tid/token/fid/page)
+	// has been committed, so snapshotThread never returns a URL paired with the
+	// previous thread's tid/token. Otherwise a reply landing in the window
+	// between setting the URL and extracting the metadata posts to the old thread.
+	s.mu.Lock()
+	s.threadURL = threadURL
+	s.mu.Unlock()
 
 	totalPages := 1
 	doc.Find(".side-pages li a").Each(func(i int, sel *goquery.Selection) {

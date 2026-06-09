@@ -202,7 +202,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     final wasLiked = _isLiked(post);
     setState(() => _likeOverride[post.num] = !wasLiked);
     try {
-      await api.like(post.num);
+      await api.like(post.num, url: widget.url);
     } catch (e) {
       if (mounted) setState(() => _likeOverride[post.num] = wasLiked);
       _snack(e is MvApiException ? e.message : '$e');
@@ -275,7 +275,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     final text = controller.text.trim();
     if (text.isEmpty) return;
     try {
-      await api.editPost(post.num, text);
+      await api.editPost(post.num, text, url: widget.url);
       _snack('Mensaje editado');
       await _load(_page?.currentPage ?? widget.initialPage);
     } catch (e) {
@@ -293,7 +293,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     }
     setState(() => _sending = true);
     try {
-      await api.reply(text, replyToNum: _replyToNum);
+      await api.reply(text, replyToNum: _replyToNum, url: widget.url);
       _composer.clear();
       _composerFocus.unfocus();
       setState(() => _replyToNum = 0);

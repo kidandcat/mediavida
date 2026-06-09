@@ -372,7 +372,8 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return
 		}
 		var req struct {
-			PostNum int `json:"post_num"`
+			PostNum int    `json:"post_num"`
+			URL     string `json:"url,omitempty"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -382,7 +383,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "post_num must be > 0")
 			return
 		}
-		if err := scraper.LikeMessage(req.PostNum); err != nil {
+		if err := scraper.LikeMessage(req.PostNum, req.URL); err != nil {
 			writeAPIError(w, err)
 			return
 		}
@@ -401,6 +402,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		var req struct {
 			Text       string `json:"text"`
 			ReplyToNum int    `json:"reply_to_num,omitempty"`
+			URL        string `json:"url,omitempty"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -410,7 +412,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "text is required")
 			return
 		}
-		if err := scraper.PostReply(req.Text, req.ReplyToNum); err != nil {
+		if err := scraper.PostReply(req.Text, req.ReplyToNum, req.URL); err != nil {
 			writeAPIError(w, err)
 			return
 		}
@@ -499,6 +501,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		var req struct {
 			PostNum int    `json:"post_num"`
 			Text    string `json:"text"`
+			URL     string `json:"url,omitempty"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -512,7 +515,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "text is required")
 			return
 		}
-		if err := scraper.EditMessage(req.PostNum, req.Text); err != nil {
+		if err := scraper.EditMessage(req.PostNum, req.Text, req.URL); err != nil {
 			writeAPIError(w, err)
 			return
 		}

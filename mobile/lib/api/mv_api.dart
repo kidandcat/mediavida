@@ -253,16 +253,22 @@ class MvApi {
     return ThreadPage.fromJson(d);
   }
 
-  /// Like/unlike a post in the last-read thread. Call right after [thread].
-  Future<void> like(int postNum) async {
-    final r = await _dio.post('/threads/like', data: {'post_num': postNum});
+  /// Like/unlike a post. Pass [url] (the thread URL) so the backend posts to the
+  /// right thread even if its "last-read thread" state drifted to another one.
+  Future<void> like(int postNum, {String? url}) async {
+    final r = await _dio.post('/threads/like',
+        data: {'post_num': postNum, if (url != null && url.isNotEmpty) 'url': url});
     if (r.statusCode != 200) _fail(r);
   }
 
-  /// Reply to the last-read thread. Call right after [thread].
-  Future<void> reply(String text, {int replyToNum = 0}) async {
-    final r = await _dio.post('/threads/reply',
-        data: {'text': text, if (replyToNum > 0) 'reply_to_num': replyToNum});
+  /// Reply to a thread. Pass [url] (the thread URL) so the reply always lands in
+  /// the open thread, not whatever the backend last had loaded.
+  Future<void> reply(String text, {int replyToNum = 0, String? url}) async {
+    final r = await _dio.post('/threads/reply', data: {
+      'text': text,
+      if (replyToNum > 0) 'reply_to_num': replyToNum,
+      if (url != null && url.isNotEmpty) 'url': url,
+    });
     if (r.statusCode != 200) _fail(r);
   }
 
@@ -287,9 +293,14 @@ class MvApi {
         .toList();
   }
 
-  /// Edit one of the user's own posts in the last-read thread.
-  Future<void> editPost(int postNum, String text) async {
-    final r = await _dio.post('/threads/edit', data: {'post_num': postNum, 'text': text});
+  /// Edit one of the user's own posts. Pass [url] (the thread URL) so the edit
+  /// targets the right thread regardless of stale backend state.
+  Future<void> editPost(int postNum, String text, {String? url}) async {
+    final r = await _dio.post('/threads/edit', data: {
+      'post_num': postNum,
+      'text': text,
+      if (url != null && url.isNotEmpty) 'url': url,
+    });
     if (r.statusCode != 200) _fail(r);
   }
 

@@ -190,14 +190,13 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeJSON(w, http.StatusOK, statusResponse{Status: "unauthenticated"})
 			return
 		}
-		// Validate liveness; relogin if expired.
-		if !s.Scraper.ValidateSession() {
-			log.Printf("[auth/status] session invalid for %s, attempting re-login", s.Scraper.Username())
-			if err := s.Scraper.Relogin(); err != nil {
-				writeJSON(w, http.StatusOK, statusResponse{Status: "unauthenticated"})
-				return
-			}
-		}
+		// Do NOT probe MV here. A live session row in Colmena (rehydrated by
+		// sessions.Get) is enough to report "authenticated". Probing MV on every
+		// status check made a transient upstream failure (anti-bot challenge,
+		// rate-limit, network) report "unauthenticated" and kick the user to the
+		// login screen even though the session was fine. Real liveness is
+		// resolved reactively: the first data operation that hits a dead session
+		// recovers via withRelogin, or returns 401 only when re-login truly fails.
 		writeJSON(w, http.StatusOK, statusResponse{Status: "authenticated", Username: s.Scraper.Username()})
 	})
 
@@ -271,7 +270,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeAPIError(w, err)
 			return
 		}
-		if body, err := json.Marshal(map[string]any{"items": items}); err == nil {
+		if body, err := json.Marshal(map[string]any{"items": items}); err == nil { // safe-ignore: intentional scoped err in if-init
 			sharedCache.Set(cacheKey, body)
 			writeCachedJSON(w, body)
 			return
@@ -299,7 +298,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeAPIError(w, err)
 			return
 		}
-		if body, err := json.Marshal(map[string]any{"categories": cats}); err == nil {
+		if body, err := json.Marshal(map[string]any{"categories": cats}); err == nil { // safe-ignore: intentional scoped err in if-init
 			sharedCache.Set(cacheKey, body)
 			writeCachedJSON(w, body)
 			return
@@ -383,7 +382,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "post_num must be > 0")
 			return
 		}
-		if err := scraper.LikeMessage(req.PostNum, req.URL); err != nil {
+		if err := withRelogin(scraper, func() error { return scraper.LikeMessage(req.PostNum, req.URL) }); err != nil {
 			writeAPIError(w, err)
 			return
 		}
@@ -412,7 +411,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "text is required")
 			return
 		}
-		if err := scraper.PostReply(req.Text, req.ReplyToNum, req.URL); err != nil {
+		if err := withRelogin(scraper, func() error { return scraper.PostReply(req.Text, req.ReplyToNum, req.URL) }); err != nil {
 			writeAPIError(w, err)
 			return
 		}
@@ -431,7 +430,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
 			return
 		}
-		src, err := scraper.GetPostSource(num)
+		var src string
+		err := withRelogin(scraper, func() error {
+			var e error
+			src, e = scraper.GetPostSource(num)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -450,7 +454,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
 			return
 		}
-		author, bodyHTML, err := scraper.GetQuotedPost(num)
+		var author, bodyHTML string
+		err := withRelogin(scraper, func() error {
+			var e error
+			author, bodyHTML, e = scraper.GetQuotedPost(num)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -515,7 +524,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "text is required")
 			return
 		}
-		if err := scraper.EditMessage(req.PostNum, req.Text, req.URL); err != nil {
+		if err := withRelogin(scraper, func() error { return scraper.EditMessage(req.PostNum, req.Text, req.URL) }); err != nil {
 			writeAPIError(w, err)
 			return
 		}
@@ -547,7 +556,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "title and body are required (use GET /threads/tags?subforum=... to discover tag IDs)")
 			return
 		}
-		raw, err := scraper.CreateThread(req.Subforum, req.Title, req.Body, req.Tag, req.AddToFavorites)
+		var raw string
+		err := withRelogin(scraper, func() error {
+			var e error
+			raw, e = scraper.CreateThread(req.Subforum, req.Title, req.Body, req.Tag, req.AddToFavorites)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -578,7 +592,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "subforum query parameter is required")
 			return
 		}
-		page, err := scraper.FetchNewThreadPage(subforum)
+		var page *NewThreadPage
+		err := withRelogin(scraper, func() error {
+			var e error
+			page, e = scraper.FetchNewThreadPage(subforum)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -602,7 +621,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "q query parameter is required")
 			return
 		}
-		results, err := scraper.Search(query)
+		var results []SearchResult
+		err := withRelogin(scraper, func() error {
+			var e error
+			results, e = scraper.Search(query)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -620,7 +644,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			return
 		}
 		page, _ := strconv.Atoi(r.URL.Query().Get("page")) // safe-ignore: 0 fallback is the intended default
-		items, err := scraper.FetchInbox(page)
+		var items []InboxItem
+		err := withRelogin(scraper, func() error {
+			var e error
+			items, e = scraper.FetchInbox(page)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -642,7 +671,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "id is required")
 			return
 		}
-		conv, err := scraper.FetchConversation(id)
+		var conv *Conversation
+		err := withRelogin(scraper, func() error {
+			var e error
+			conv, e = scraper.FetchConversation(id)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -687,7 +721,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		if scraper == nil {
 			return
 		}
-		items, err := scraper.FetchFavorites()
+		var items []ThreadListItem
+		err := withRelogin(scraper, func() error {
+			var e error
+			items, e = scraper.FetchFavorites()
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -705,7 +744,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		if username == "" {
 			username = scraper.Username()
 		}
-		items, err := scraper.FetchUserPosts(username)
+		var items []ThreadListItem
+		err := withRelogin(scraper, func() error {
+			var e error
+			items, e = scraper.FetchUserPosts(username)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -726,7 +770,12 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		if username == "" {
 			username = scraper.Username()
 		}
-		items, err := scraper.FetchMentions(username)
+		var items []MentionItem
+		err := withRelogin(scraper, func() error {
+			var e error
+			items, e = scraper.FetchMentions(username)
+			return e
+		})
 		if err != nil {
 			writeAPIError(w, err)
 			return

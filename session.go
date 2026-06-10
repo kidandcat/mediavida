@@ -85,14 +85,11 @@ func (ss *SessionStore) restoreFromRecord(rec SessionRecord) bool {
 		scraper.SetTOTPSecret(secret)
 	}
 	if !scraper.loadFromRecord(rec) {
-		return false
-	}
-
-	// Validate the session is still valid server-side
-	if !scraper.ValidateSession() {
-		log.Printf("Session for client %s is expired, attempting re-login", rec.ClientID)
+		// No usable cookies left (all expired by date, or the record is
+		// corrupt). There is nothing to trust, so a fresh login is the only
+		// way to recover — do it lazily here when we have credentials.
 		if scraper.Username() == "" || scraper.pass == "" {
-			log.Printf("No credentials available for re-login (client %s)", rec.ClientID)
+			log.Printf("No usable cookies and no credentials for re-login (client %s)", rec.ClientID)
 			return false
 		}
 		if err := scraper.Relogin(); err != nil {
@@ -101,6 +98,15 @@ func (ss *SessionStore) restoreFromRecord(rec SessionRecord) bool {
 		}
 	}
 
+	// IMPORTANT: do NOT probe MV here (no ValidateSession). The cookies in
+	// Colmena are the freshest copy in the cluster, so we trust them and mark
+	// the session authenticated immediately. Probing MV on every cross-node
+	// rehydration was the cause of spurious logouts: any transient failure of
+	// that HTTP call (anti-bot challenge, rate-limit, 5xx, network) made us
+	// discard a perfectly valid session and kick the user to the login screen.
+	// If the cookies really are dead, the first real data operation detects it
+	// via ErrSessionExpired and recovers through withRelogin (see api.go) —
+	// reactive recovery, no false logout.
 	session := &Session{
 		Scraper: scraper,
 		Status:  "authenticated",
@@ -108,7 +114,7 @@ func (ss *SessionStore) restoreFromRecord(rec SessionRecord) bool {
 	ss.mu.Lock()
 	ss.sessions[rec.ClientID] = session
 	ss.mu.Unlock()
-	log.Printf("Session restored from Colmena for client %s (validated)", rec.ClientID)
+	log.Printf("Session restored from Colmena for client %s", rec.ClientID)
 	return true
 }
 
@@ -200,6 +206,19 @@ func (ss *SessionStore) RestoreAll() int {
 		}
 	}
 	return n
+}
+
+// CreateWatchAlias mints a new bearer token for a paired watch. It does NOT
+// duplicate the MV session: the token aliases the owner's session and resolves
+// to it at request time (see APITokenMiddleware), so there is only ever one
+// Mediavida session per account — duplicating it spawned a second concurrent
+// login and triggered guard/login storms. Pairing still requires the owner to be
+// logged in. Returns the new token; the caller records the token→owner mapping.
+func (ss *SessionStore) CreateWatchAlias(ownerClientID string) (string, error) {
+	if ss.Get(ownerClientID) == nil {
+		return "", errors.New("no active session to pair; log in first")
+	}
+	return "wf_" + generateFlowID(), nil
 }
 
 // ForEach calls fn for each stored session while holding a read lock.

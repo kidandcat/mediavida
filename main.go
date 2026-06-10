@@ -144,6 +144,7 @@ func main() {
 	// FCM push (nil if FCM_SA_JSON/FCM_PROJECT_ID unset). Per-device tokens are
 	// registered via POST /push/register.
 	fcmTokens := NewFCMTokenStore(colmenaStore)
+	watchTokens := NewWatchTokenStore(colmenaStore)
 	fcmSender := NewFCMSender(fcmTokens)
 
 	// Start bubbles poller for SSE/webhook push notifications. Mod-forum
@@ -163,12 +164,13 @@ func main() {
 	// REST API mux — everything here requires Authorization: Bearer <token>.
 	apiMux := http.NewServeMux()
 	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, fcmTokens, baseURL)
+	RegisterWatchRoutes(apiMux, sessions, watchTokens, baseURL)
 
 	// Per-client API rate limiter (PLAN_SCALE 2.2 / Phase 1). Sits AFTER auth so
 	// it can read the clientID from the request context. Defaults: ~5 req/s
 	// sustained, burst 20.
 	limiter := NewRateLimiter(5, 20)
-	apiHandler := APITokenMiddleware(apiTokens, sessions, limiter.Middleware(apiMux))
+	apiHandler := APITokenMiddleware(apiTokens, sessions, watchTokens, limiter.Middleware(apiMux))
 
 	root := http.NewServeMux()
 	// Health check for Fly's rolling deploy (keeps Raft quorum). 200 once this

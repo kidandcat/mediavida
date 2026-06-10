@@ -1,0 +1,12 @@
+{
+  "name": "mediavida-watch-amazfit-active2-round-watchface",
+  "version": "1.0.0",
+  "description": "Mediavida watchface for Amazfit Active 2 (round) — renders bubble badges + analog clock",
+  "private": true,
+  "scripts": {
+    "dev": "zeus dev",
+    "build": "zeus build",
+    "preview": "zeus preview"
+  },
+  "devDependencies": {}
+}

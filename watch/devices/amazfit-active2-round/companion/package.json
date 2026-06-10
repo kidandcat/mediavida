@@ -1,0 +1,14 @@
+{
+  "name": "mediavida-watch-companion",
+  "version": "1.0.0",
+  "description": "Companion app for Mediavida watchface - provides HTTP data fetching via Side Service",
+  "private": true,
+  "scripts": {
+    "dev": "zeus dev",
+    "build": "zeus build",
+    "preview": "zeus preview"
+  },
+  "dependencies": {
+    "@zeppos/zml": "^0.0.43"
+  }
+}

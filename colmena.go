@@ -135,11 +135,25 @@ func (cs *ColmenaStore) migrate() error {
 			slug     TEXT NOT NULL,
 			PRIMARY KEY (username, slug)
 		)`,
+		`CREATE TABLE IF NOT EXISTS watch_tokens (
+			token      TEXT PRIMARY KEY,
+			owner      TEXT NOT NULL,
+			label      TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := cs.db.Exec(s); err != nil {
 			return err
 		}
+	}
+	// Idempotent cleanup: earlier versions minted watch tokens by COPYING the
+	// owner's MV session under a `wf_` client_id, creating a second concurrent
+	// Mediavida login per account (guard/login storms). Watch tokens now alias
+	// the owner's session at request time, so drop any leftover copied watch
+	// sessions. The watch_tokens mapping rows are kept.
+	if _, err := cs.db.Exec(`DELETE FROM mv_sessions WHERE client_id LIKE 'wf_%'`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -350,6 +364,62 @@ func (cs *ColmenaStore) AllModForums() (map[string][]string, error) {
 		out[u] = append(out[u], slug)
 	}
 	return out, rows.Err()
+}
+
+// --- durable watch pairing tokens (Raft) ---
+
+// WatchTokenRecord is one paired watch: a bearer token that aliases an owner's
+// MV session so the watch can fetch /bubbles autonomously after a one-time pair.
+type WatchTokenRecord struct {
+	Token     string
+	Owner     string
+	Label     string
+	CreatedAt int64
+}
+
+// AddWatchToken registers (or relabels) a paired-watch token for an owner.
+func (cs *ColmenaStore) AddWatchToken(token, owner, label string) error {
+	_, err := cs.db.Exec(
+		`INSERT INTO watch_tokens (token, owner, label, created_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(token) DO UPDATE SET owner=excluded.owner, label=excluded.label`,
+		token, owner, label, time.Now().Unix(),
+	)
+	return err
+}
+
+// ListWatchTokens returns an owner's paired watches, newest first.
+func (cs *ColmenaStore) ListWatchTokens(owner string) ([]WatchTokenRecord, error) {
+	rows, err := cs.db.Query(
+		`SELECT token, owner, label, created_at FROM watch_tokens WHERE owner = ? ORDER BY created_at DESC`, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }() // safe-ignore: best-effort cursor close
+	var out []WatchTokenRecord
+	for rows.Next() {
+		var r WatchTokenRecord
+		if serr := rows.Scan(&r.Token, &r.Owner, &r.Label, &r.CreatedAt); serr != nil {
+			return nil, serr
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetWatchTokenOwner resolves a watch token to its owner (ok=false if absent).
+func (cs *ColmenaStore) GetWatchTokenOwner(token string) (string, bool, error) {
+	var owner string
+	err := cs.db.QueryRow(`SELECT owner FROM watch_tokens WHERE token = ?`, token).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return owner, err == nil, err
+}
+
+// DeleteWatchToken removes a paired-watch token (revocation).
+func (cs *ColmenaStore) DeleteWatchToken(token string) error {
+	_, err := cs.db.Exec(`DELETE FROM watch_tokens WHERE token = ?`, token)
+	return err
 }
 
 func envOr(key, def string) string {

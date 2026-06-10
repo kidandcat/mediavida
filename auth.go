@@ -136,8 +136,14 @@ button:hover{background:#1a4a8a}
 // --- API Token Middleware ---
 
 // APITokenMiddleware validates the Bearer token against the allowed API tokens.
-// Sets the client ID (the token itself) in the request context.
-func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, next http.Handler) http.Handler {
+// Sets the client ID in the request context.
+//
+// Watch tokens (minted by /watch/pair) have NO session of their own: they alias
+// the owner's session. Duplicating the session per watch used to spawn a second
+// concurrent Mediavida login per account and triggered guard/login storms, so a
+// watch token instead resolves to its owner's client ID here — one MV session
+// per account, shared by the phone and the watch.
+func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, watchTokens *WatchTokenStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -146,14 +152,24 @@ func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, nex
 		}
 
 		token := strings.TrimPrefix(auth, "Bearer ")
+		clientID := token
 		// Valid if it's a configured API token (legacy/tooling) or it has a live
 		// session created via /auth/app-login (per-device app login).
 		if !validTokens[token] && (sessions == nil || sessions.Get(token) == nil) {
-			http.Error(w, "unauthorized: invalid API token", http.StatusUnauthorized)
-			return
+			// Otherwise it may be a watch token — resolve it to its owner so it
+			// reuses the owner's single MV session.
+			owner, ok := "", false
+			if watchTokens != nil {
+				owner, ok = watchTokens.Owner(token)
+			}
+			if !ok || sessions == nil || sessions.Get(owner) == nil {
+				http.Error(w, "unauthorized: invalid API token", http.StatusUnauthorized)
+				return
+			}
+			clientID = owner
 		}
 
-		ctx := context.WithValue(r.Context(), clientIDKey, token)
+		ctx := context.WithValue(r.Context(), clientIDKey, clientID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

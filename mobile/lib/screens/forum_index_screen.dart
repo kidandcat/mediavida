@@ -29,6 +29,11 @@ class ForumIndexScreen extends ConsumerWidget {
             style: TextButton.styleFrom(foregroundColor: context.scheme.primary),
           ),
           IconButton(
+            icon: const Icon(Icons.watch),
+            tooltip: 'Relojes',
+            onPressed: () => context.openWatches(),
+          ),
+          IconButton(
             icon: const Icon(Icons.logout),
             tooltip: 'Cerrar sesión',
             onPressed: () => ref.read(configProvider.notifier).signOut(),

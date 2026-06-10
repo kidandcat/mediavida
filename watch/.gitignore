@@ -1,0 +1,13 @@
+# Generated per-app shared/ dirs — synced from watch/shared/ by sync-shared.sh.
+# The single source of truth is watch/shared/; these copies are build artifacts.
+devices/*/*/shared/
+
+# Zeus build output
+dist/
+**/dist/
+
+# Tooling
+node_modules/
+**/node_modules/
+package-lock.json
+.DS_Store

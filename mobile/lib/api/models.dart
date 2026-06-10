@@ -386,6 +386,31 @@ class MvNotification {
       );
 }
 
+/// Result of pairing a watch: the minted watch token plus the backend base URL
+/// the watch should talk to directly afterwards. Returned by `POST /watch/pair`.
+class WatchPairResult {
+  final String token;
+  final String baseUrl;
+  const WatchPairResult({required this.token, required this.baseUrl});
+  factory WatchPairResult.fromJson(Map<String, dynamic> j) => WatchPairResult(
+        token: _s(j['token']),
+        baseUrl: _s(j['base_url']),
+      );
+}
+
+/// A watch paired to the user's session, returned by `GET /watch/tokens`.
+class PairedWatch {
+  final String token;
+  final String label;
+  final int createdAt; // unix seconds
+  const PairedWatch({required this.token, this.label = '', this.createdAt = 0});
+  factory PairedWatch.fromJson(Map<String, dynamic> j) => PairedWatch(
+        token: _s(j['token']),
+        label: _s(j['label']),
+        createdAt: _i(j['created_at']),
+      );
+}
+
 class Bubbles {
   final int messages;
   final int notifications;

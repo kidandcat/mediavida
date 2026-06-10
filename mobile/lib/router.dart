@@ -10,6 +10,7 @@ import 'screens/new_thread_screen.dart';
 import 'screens/setup_screen.dart';
 import 'screens/thread_screen.dart';
 import 'screens/user_screen.dart';
+import 'screens/watches_screen.dart';
 import 'state/providers.dart';
 
 /// Router. Redirects to /setup until the app has a base URL + token.
@@ -66,6 +67,7 @@ GoRouter buildRouter(WidgetRef ref) {
         path: '/user/:username',
         builder: (c, s) => UserScreen(username: s.pathParameters['username']!),
       ),
+      GoRoute(path: '/watches', builder: (c, s) => const WatchesScreen()),
     ],
   );
 }
@@ -95,6 +97,7 @@ extension MvNav on BuildContext {
   void openConversation(String id, {String title = ''}) =>
       push('/conversation/$id', extra: {'title': title});
   void openUser(String username) => push('/user/$username');
+  void openWatches() => push('/watches');
 
   /// Opens a thread from a Mediavida URL, handling the two shapes MV uses:
   ///  - legacy/notification form: `.../foro/tema.php?tid=X&pagina=Y#POSTNUM`

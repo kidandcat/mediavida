@@ -388,6 +388,30 @@ class MvApi {
         .toList();
   }
 
+  // --- watches (Amazfit pairing) ---
+
+  /// Mint a watch token aliasing this device's session. The watch then talks to
+  /// the backend directly using the returned token + base URL.
+  Future<WatchPairResult> pairWatch({String? label}) async {
+    final d = _obj(await _dio.post('/watch/pair',
+        data: {if (label != null && label.isNotEmpty) 'label': label}));
+    return WatchPairResult.fromJson(d);
+  }
+
+  /// List the watches currently paired to this device's session.
+  Future<List<PairedWatch>> watchTokens() async {
+    final d = _obj(await _dio.get('/watch/tokens'));
+    return ((d['watches'] as List?) ?? [])
+        .map((e) => PairedWatch.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Revoke a previously paired watch token.
+  Future<void> revokeWatch(String token) async {
+    final r = await _dio.delete('/watch/pair/$token');
+    if (r.statusCode != 200) _fail(r);
+  }
+
   // --- notifications ---
 
   Future<Bubbles>? _bubblesInFlight;

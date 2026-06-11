@@ -721,11 +721,13 @@ func (s *ForumScraper) GetQuotedPost(postNum int, wantURL string) (author, bodyH
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("quote returned %d", resp.StatusCode)
 	}
-	// post_quote.php returns JSON {status, min, full} with the quote source text.
+	// post_quote.php returns JSON {status, min, full, autor} with the rendered
+	// post HTML (or an error text like "El mensaje no existe" when status is 0).
 	var res struct {
 		Status int    `json:"status"`
 		Min    string `json:"min"`
 		Full   string `json:"full"`
+		Autor  string `json:"autor"`
 	}
 	if derr := json.Unmarshal(body, &res); derr != nil {
 		return "", strings.TrimSpace(string(body)), nil
@@ -734,7 +736,7 @@ func (s *ForumScraper) GetQuotedPost(postNum int, wantURL string) (author, bodyH
 	if text == "" {
 		text = res.Min
 	}
-	return "", text, nil
+	return res.Autor, text, nil
 }
 
 // QuotedReply is one forward-quote reply to a post (mediavida's post_quoted.php).

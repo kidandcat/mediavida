@@ -88,8 +88,11 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     final api = ref.read(apiProvider);
     if (api == null) return null;
     try {
-      final text = await api.quotedPost(num, url: widget.url);
-      return RefPost(author: '', bodyText: text);
+      final q = await api.quotedPost(num, url: widget.url);
+      return RefPost(
+        author: q.author,
+        bodyHtml: q.bodyHtml.trim().isNotEmpty ? q.bodyHtml : null,
+      );
     } catch (_) {
       return null;
     }

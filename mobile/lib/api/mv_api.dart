@@ -285,14 +285,17 @@ class MvApi {
     return d['source']?.toString() ?? '';
   }
 
-  /// Fetch the text of a referenced post (#NNNN). Pass [url] (the thread URL)
-  /// so any backend node can serve the request.
-  Future<String> quotedPost(int postNum, {String? url}) async {
+  /// Fetch a referenced post (#NNNN) as rendered HTML plus its author. Pass
+  /// [url] (the thread URL) so any backend node can serve the request.
+  Future<({String author, String bodyHtml})> quotedPost(int postNum, {String? url}) async {
     final d = _obj(await _dio.get('/threads/quote', queryParameters: {
       'num': postNum,
       if (url != null && url.isNotEmpty) 'url': url,
     }));
-    return d['body_html']?.toString() ?? '';
+    return (
+      author: d['author']?.toString() ?? '',
+      bodyHtml: d['body_html']?.toString() ?? '',
+    );
   }
 
   /// Fetch the forward-quote replies to a post (the web's "N respuestas").

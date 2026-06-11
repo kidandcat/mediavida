@@ -639,11 +639,16 @@ func (s *ForumScraper) LikeMessage(postNum int, wantURL string) error {
 	return nil
 }
 
-// GetPostSource returns the raw (editable) source text of a post in the
-// last-read thread. Fetch the thread first so tid/token are set.
-func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
+// GetPostSource returns the raw (editable) source text of a post in the given
+// thread. wantURL re-syncs tid/token when this node's thread state is stale or
+// empty (requests are load-balanced across nodes); empty wantURL keeps the old
+// "last-read thread" behavior.
+func (s *ForumScraper) GetPostSource(postNum int, wantURL string) (string, error) {
 	if !s.isLoggedIn() {
 		return "", fmt.Errorf("not logged in")
+	}
+	if err := s.ensureThread(wantURL); err != nil {
+		return "", err
 	}
 	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
 	if threadID == "" || csrfToken == "" {
@@ -676,12 +681,17 @@ func (s *ForumScraper) GetPostSource(postNum int) (string, error) {
 	return string(body), nil
 }
 
-// GetQuotedPost fetches a single post of the last-read thread by number,
-// as the web does when expanding a #NNNN reference (post_quote.php).
-// Returns the author and the rendered, URL-absolutized HTML body.
-func (s *ForumScraper) GetQuotedPost(postNum int) (author, bodyHTML string, err error) {
+// GetQuotedPost fetches a single post of the given thread by number, as the
+// web does when expanding a #NNNN reference (post_quote.php). wantURL re-syncs
+// tid/token when this node's thread state is stale or empty (requests are
+// load-balanced across nodes); empty wantURL keeps the old "last-read thread"
+// behavior. Returns the author and the rendered, URL-absolutized HTML body.
+func (s *ForumScraper) GetQuotedPost(postNum int, wantURL string) (author, bodyHTML string, err error) {
 	if !s.isLoggedIn() {
 		return "", "", fmt.Errorf("not logged in")
+	}
+	if err := s.ensureThread(wantURL); err != nil {
+		return "", "", err
 	}
 	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
 	if threadID == "" || csrfToken == "" {
@@ -736,11 +746,17 @@ type QuotedReply struct {
 	Date     string // human date label (fecha2, text-only)
 }
 
-// GetPostQuoted fetches the posts that quote/reply to postNum in the current
-// thread (the web's "N respuestas" expander -> post_quoted.php). Read the thread first.
-func (s *ForumScraper) GetPostQuoted(postNum int) ([]QuotedReply, error) {
+// GetPostQuoted fetches the posts that quote/reply to postNum in the given
+// thread (the web's "N respuestas" expander -> post_quoted.php). wantURL
+// re-syncs tid/token when this node's thread state is stale or empty (requests
+// are load-balanced across nodes); empty wantURL keeps the old "last-read
+// thread" behavior.
+func (s *ForumScraper) GetPostQuoted(postNum int, wantURL string) ([]QuotedReply, error) {
 	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")
+	}
+	if err := s.ensureThread(wantURL); err != nil {
+		return nil, err
 	}
 	csrfToken, threadID, _, _, threadURL := s.snapshotThread()
 	if threadID == "" || csrfToken == "" {
@@ -1174,6 +1190,99 @@ func (s *ForumScraper) FetchFavorites() ([]ThreadListItem, error) {
 }
 
 // FetchUserPosts returns threads where the given user has posted.
+// Profile is a user's public profile as shown on /id/<username>.
+type Profile struct {
+	Username   string `json:"username"`
+	Avatar     string `json:"avatar"`
+	Cover      string `json:"cover"`
+	Rank       string `json:"rank"`
+	Registered string `json:"registered"`
+	Posts      int    `json:"posts"`
+	Threads    int    `json:"threads"`
+	Visits     int    `json:"visits"`
+	Bio        string `json:"bio"`
+	Online     bool   `json:"online"`
+}
+
+// FetchProfile scrapes /id/<username> and returns the public profile fields
+// shown in the page header (avatar, cover, rank, registration date and the
+// posts/threads/visits counters).
+func (s *ForumScraper) FetchProfile(username string) (*Profile, error) {
+	if !s.isLoggedIn() {
+		return nil, &ErrSessionExpired{}
+	}
+	resp, err := s.doGet("https://www.mediavida.com/id/" + username)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// A 302/403 here means the cookies are no longer valid server-side;
+		// surface it as expired so withRelogin can recover.
+		return nil, &ErrSessionExpired{}
+	}
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	cover := doc.Find("#cover").First()
+	if cover.Length() == 0 {
+		// No profile header → we were served the login/challenge page.
+		return nil, &ErrSessionExpired{}
+	}
+
+	p := &Profile{Username: username}
+	if h1 := strings.TrimSpace(cover.Find("h1").First().Text()); h1 != "" {
+		p.Username = h1
+	}
+	if src, ok := doc.Find("img.avatar").First().Attr("src"); ok {
+		p.Avatar = mvAbsURL(src)
+	}
+	if bg, ok := cover.Attr("data-bg"); ok {
+		p.Cover = mvAbsURL(bg)
+	}
+	p.Rank = strings.TrimSpace(cover.Find(".l2").First().Text())
+	p.Bio = strings.TrimSpace(doc.Find(".post-contents").First().Text())
+
+	// The numeric stats and the registration date all live in `title`
+	// attributes: "4946 posts", "16 temas", "5758 visitas",
+	// "Se registró el 16/8 del 2018".
+	doc.Find("[title]").EachWithBreak(func(_ int, sel *goquery.Selection) bool {
+		t := strings.TrimSpace(sel.AttrOr("title", ""))
+		switch {
+		case p.Posts == 0 && strings.HasSuffix(t, " posts"):
+			p.Posts = leadingInt(t)
+		case p.Threads == 0 && strings.HasSuffix(t, " temas"):
+			p.Threads = leadingInt(t)
+		case p.Visits == 0 && strings.HasSuffix(t, " visitas"):
+			p.Visits = leadingInt(t)
+		case p.Registered == "" && strings.HasPrefix(t, "Se registró el "):
+			p.Registered = strings.TrimPrefix(t, "Se registró el ")
+		}
+		return true // keep scanning all title attributes
+	})
+
+	p.Online = strings.Contains(doc.Find(".user-meta").Text(), "Online")
+	return p, nil
+}
+
+// mvAbsURL turns a site-relative MV path into an absolute URL.
+func mvAbsURL(u string) string {
+	if u == "" || strings.HasPrefix(u, "http") {
+		return u
+	}
+	return "https://www.mediavida.com" + u
+}
+
+// leadingInt parses the leading integer of strings like "4946 posts".
+func leadingInt(s string) int {
+	n := 0
+	for i := 0; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+		n = n*10 + int(s[i]-'0')
+	}
+	return n
+}
+
 func (s *ForumScraper) FetchUserPosts(username string) ([]ThreadListItem, error) {
 	if !s.isLoggedIn() {
 		return nil, fmt.Errorf("not logged in")

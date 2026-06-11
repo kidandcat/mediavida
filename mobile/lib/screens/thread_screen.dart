@@ -88,7 +88,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     final api = ref.read(apiProvider);
     if (api == null) return null;
     try {
-      final text = await api.quotedPost(num);
+      final text = await api.quotedPost(num, url: widget.url);
       return RefPost(author: '', bodyText: text);
     } catch (_) {
       return null;
@@ -223,7 +223,7 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
     // Ensure the backend's last-read thread is this page, then fetch the source.
     String source;
     try {
-      source = await api.postSource(post.num);
+      source = await api.postSource(post.num, url: widget.url);
     } catch (e) {
       _snack(e is MvApiException ? e.message : '$e');
       return;
@@ -423,7 +423,8 @@ class _ThreadScreenState extends ConsumerState<ThreadScreen> with WidgetsBinding
             onEdit: () => _startEdit(post),
             fetchRef: _fetchRef,
             fetchReplies: (postNum) async =>
-                await ref.read(apiProvider)?.postQuoted(postNum) ?? const <QuotedReply>[],
+                await ref.read(apiProvider)?.postQuoted(postNum, url: widget.url) ??
+                const <QuotedReply>[],
           );
         },
       ),

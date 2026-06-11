@@ -419,7 +419,10 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, map[string]string{"status": "posted"})
 	})
 
-	// Raw editable source of a post in the last-read thread (call GET /threads first).
+	// Raw editable source of a post. The optional url parameter re-syncs the
+	// thread on this node (requests are load-balanced across nodes, so the
+	// thread may have been read on another one); without it the last-read
+	// thread of this node is used.
 	mux.HandleFunc("GET /threads/source", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)
 		if scraper == nil {
@@ -430,10 +433,11 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
 			return
 		}
+		threadURL := r.URL.Query().Get("url")
 		var src string
 		err := withRelogin(scraper, func() error {
 			var e error
-			src, e = scraper.GetPostSource(num)
+			src, e = scraper.GetPostSource(num, threadURL)
 			return e
 		})
 		if err != nil {
@@ -443,7 +447,10 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, map[string]any{"num": num, "source": src})
 	})
 
-	// Fetch a single post of the last-read thread by number (for #NNNN refs).
+	// Fetch a single post by number (for #NNNN refs). The optional url
+	// parameter re-syncs the thread on this node (requests are load-balanced
+	// across nodes, so the thread may have been read on another one); without
+	// it the last-read thread of this node is used.
 	mux.HandleFunc("GET /threads/quote", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)
 		if scraper == nil {
@@ -454,10 +461,11 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
 			return
 		}
+		threadURL := r.URL.Query().Get("url")
 		var author, bodyHTML string
 		err := withRelogin(scraper, func() error {
 			var e error
-			author, bodyHTML, e = scraper.GetQuotedPost(num)
+			author, bodyHTML, e = scraper.GetQuotedPost(num, threadURL)
 			return e
 		})
 		if err != nil {
@@ -467,8 +475,11 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, map[string]any{"num": num, "author": author, "body_html": bodyHTML})
 	})
 
-	// Fetch the forward-quote replies to a post of the last-read thread (the
-	// web's "N respuestas" expander -> post_quoted.php).
+	// Fetch the forward-quote replies to a post (the web's "N respuestas"
+	// expander -> post_quoted.php). The optional url parameter re-syncs the
+	// thread on this node (requests are load-balanced across nodes, so the
+	// thread may have been read on another one); without it the last-read
+	// thread of this node is used.
 	mux.HandleFunc("GET /threads/quoted", func(w http.ResponseWriter, r *http.Request) {
 		scraper, _ := requireAuthenticated(w, r, sessions)
 		if scraper == nil {
@@ -479,9 +490,10 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeError(w, http.StatusBadRequest, "num query parameter must be > 0")
 			return
 		}
+		threadURL := r.URL.Query().Get("url")
 		var replies []QuotedReply
 		err := withRelogin(scraper, func() error {
-			res, err := scraper.GetPostQuoted(num)
+			res, err := scraper.GetPostQuoted(num, threadURL)
 			if err != nil {
 				return err
 			}
@@ -785,6 +797,26 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			"username": username,
 			"mentions": mentionsDTO(items),
 		})
+	})
+
+	// Own Mediavida profile (avatar, rank, registration date, counters).
+	mux.HandleFunc("GET /profile", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		var prof *Profile
+		err := withRelogin(scraper, func() error {
+			var e error
+			prof, e = scraper.FetchProfile(scraper.Username())
+			return e
+		})
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		scraper.AutoSave()
+		writeJSON(w, http.StatusOK, prof)
 	})
 
 	mux.HandleFunc("GET /notifications", func(w http.ResponseWriter, r *http.Request) {

@@ -221,6 +221,9 @@ class MvApi {
     return d['status'] == 'authenticated' ? d['username']?.toString() : null;
   }
 
+  /// The logged-in user's Mediavida profile (avatar, rank, counters, ...).
+  Future<Profile> profile() async => Profile.fromJson(_obj(await _dio.get('/profile')));
+
   // --- forum browse ---
 
   Future<List<PortadaItem>> portada() async {
@@ -272,22 +275,33 @@ class MvApi {
     if (r.statusCode != 200) _fail(r);
   }
 
-  /// Raw editable source of a post in the last-read thread. Read the thread first.
-  Future<String> postSource(int postNum) async {
-    final d = _obj(await _dio.get('/threads/source', queryParameters: {'num': postNum}));
+  /// Raw editable source of a post. Pass [url] (the thread URL) so any backend
+  /// node can serve the request regardless of which one loaded the thread.
+  Future<String> postSource(int postNum, {String? url}) async {
+    final d = _obj(await _dio.get('/threads/source', queryParameters: {
+      'num': postNum,
+      if (url != null && url.isNotEmpty) 'url': url,
+    }));
     return d['source']?.toString() ?? '';
   }
 
-  /// Fetch the text of a referenced post (#NNNN) in the last-read thread.
-  Future<String> quotedPost(int postNum) async {
-    final d = _obj(await _dio.get('/threads/quote', queryParameters: {'num': postNum}));
+  /// Fetch the text of a referenced post (#NNNN). Pass [url] (the thread URL)
+  /// so any backend node can serve the request.
+  Future<String> quotedPost(int postNum, {String? url}) async {
+    final d = _obj(await _dio.get('/threads/quote', queryParameters: {
+      'num': postNum,
+      if (url != null && url.isNotEmpty) 'url': url,
+    }));
     return d['body_html']?.toString() ?? '';
   }
 
-  /// Fetch the forward-quote replies to a post in the last-read thread (the
-  /// web's "N respuestas"). Read the thread first — same constraint as [quotedPost].
-  Future<List<QuotedReply>> postQuoted(int postNum) async {
-    final d = _obj(await _dio.get('/threads/quoted', queryParameters: {'num': postNum}));
+  /// Fetch the forward-quote replies to a post (the web's "N respuestas").
+  /// Pass [url] (the thread URL) — same reason as [quotedPost].
+  Future<List<QuotedReply>> postQuoted(int postNum, {String? url}) async {
+    final d = _obj(await _dio.get('/threads/quoted', queryParameters: {
+      'num': postNum,
+      if (url != null && url.isNotEmpty) 'url': url,
+    }));
     return ((d['posts'] as List?) ?? [])
         .map((e) => QuotedReply.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -392,9 +406,15 @@ class MvApi {
 
   /// Mint a watch token aliasing this device's session. The watch then talks to
   /// the backend directly using the returned token + base URL.
-  Future<WatchPairResult> pairWatch({String? label}) async {
-    final d = _obj(await _dio.post('/watch/pair',
-        data: {if (label != null && label.isNotEmpty) 'label': label}));
+  ///
+  /// [replaces] is the token this pair supersedes (a watch self-healing after a
+  /// 401): the backend revokes it after minting, so the paired-watches list
+  /// keeps one entry per physical watch.
+  Future<WatchPairResult> pairWatch({String? label, String? replaces}) async {
+    final d = _obj(await _dio.post('/watch/pair', data: {
+      if (label != null && label.isNotEmpty) 'label': label,
+      if (replaces != null && replaces.isNotEmpty) 'replaces': replaces,
+    }));
     return WatchPairResult.fromJson(d);
   }
 

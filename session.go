@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -126,17 +127,28 @@ func (ss *SessionStore) CreateFromCredentials(clientID, user, pass string) error
 		scraper.SetTOTPSecret(secret)
 	}
 
-	// Try loading a saved session first
+	// Try loading a saved session first. Only reuse it if it belongs to the
+	// account the caller is logging in as: the stored record is keyed by
+	// client token, so it may hold a different user's session (e.g. the boot
+	// auto-login from MV_USERNAME). Restoring it blindly would silently hand
+	// the caller someone else's identity.
 	if scraper.LoadSession() {
-		session := &Session{
-			Scraper: scraper,
-			Status:  "authenticated",
+		if strings.EqualFold(scraper.Username(), user) {
+			session := &Session{
+				Scraper: scraper,
+				Status:  "authenticated",
+			}
+			ss.mu.Lock()
+			ss.sessions[clientID] = session
+			ss.mu.Unlock()
+			log.Printf("Session restored from disk for client %s", clientID)
+			return nil
 		}
-		ss.mu.Lock()
-		ss.sessions[clientID] = session
-		ss.mu.Unlock()
-		log.Printf("Session restored from disk for client %s", clientID)
-		return nil
+		log.Printf("Stored session for client %s belongs to %q, not %q — discarding it and logging in fresh", clientID, scraper.Username(), user)
+		scraper = NewForumScraper(user, pass, clientID, ss.cs)
+		if secret := os.Getenv("MV_TOTP_SECRET"); secret != "" {
+			scraper.SetTOTPSecret(secret)
+		}
 	}
 
 	err := scraper.Login()

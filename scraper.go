@@ -690,7 +690,7 @@ func (s *ForumScraper) GetQuotedPost(postNum int, wantURL string) (author, bodyH
 	if !s.isLoggedIn() {
 		return "", "", fmt.Errorf("not logged in")
 	}
-	if err := s.ensureThread(wantURL); err != nil {
+	if err = s.ensureThread(wantURL); err != nil {
 		return "", "", err
 	}
 	csrfToken, threadID, _, _, threadURL := s.snapshotThread()

@@ -53,6 +53,8 @@ type pushJob struct {
 	username string
 	prev     *Bubbles
 	current  *Bubbles
+	fav      []ThreadActivity  // per-thread favorite enrichment (nil = count-only)
+	mentions []MentionActivity // per-thread mention enrichment (nil = count-only)
 }
 
 // BubblesPoller polls bubbles.php for each authenticated session and broadcasts
@@ -63,9 +65,10 @@ type BubblesPoller struct {
 	sessions  *SessionStore
 	webhooks  *WebhookStore
 	telegram  *TelegramBot
-	ntfy      *NtfyPublisher  // ntfy push (nil when not configured)
-	fcm       *FCMSender      // FCM push (nil when not configured)
-	modForums *ModForumsStore // per-mv-user subforum subscriptions
+	ntfy      *NtfyPublisher     // ntfy push (nil when not configured)
+	fcm       *FCMSender         // FCM push (nil when not configured)
+	pending   *PendingNotifStore // durable mirror of unseen avisos (badge source)
+	modForums *ModForumsStore    // per-mv-user subforum subscriptions
 
 	// jobs is the colmena jobs manager that runs poll_session jobs under a
 	// cluster-wide rate limit. Built in Start() from cs.Node(). It may also be
@@ -81,6 +84,7 @@ type BubblesPoller struct {
 	stateMu        sync.Mutex
 	modMu          sync.Mutex                                // serializes checkMod (rare mod users) so its maps stay race-free
 	prev           map[string]*Bubbles                       // clientID → last known bubbles
+	prevFav        map[string]map[string]int                 // clientID → threadKey → last seen unread count (favorites)
 	prevMod        map[string]map[string]*ModBubbles         // clientID → slug → last mod counters
 	prevReports    map[string]map[string]map[string]struct{} // clientID → slug → set of report keys
 	breaker        map[string]*breakerState                  // clientID → failure backoff
@@ -95,7 +99,7 @@ type BubblesPoller struct {
 // NewBubblesPoller builds the poller. cs is the durable Colmena store whose node
 // backs the jobs.Manager used for cluster-wide rate limiting of MV scrapes; it
 // must be non-nil (Colmena is the only persistence layer — no fallback).
-func NewBubblesPoller(cs *ColmenaStore, hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, ntfy *NtfyPublisher, fcm *FCMSender, modForums *ModForumsStore) *BubblesPoller {
+func NewBubblesPoller(cs *ColmenaStore, hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, ntfy *NtfyPublisher, fcm *FCMSender, pending *PendingNotifStore, modForums *ModForumsStore) *BubblesPoller {
 	prevMod, prevReports := loadModState()
 	return &BubblesPoller{
 		cs:          cs,
@@ -105,8 +109,10 @@ func NewBubblesPoller(cs *ColmenaStore, hub *EventHub, sessions *SessionStore, w
 		telegram:    telegram,
 		ntfy:        ntfy,
 		fcm:         fcm,
+		pending:     pending,
 		modForums:   modForums,
 		prev:        make(map[string]*Bubbles),
+		prevFav:     make(map[string]map[string]int),
 		prevMod:     prevMod,
 		prevReports: prevReports,
 		breaker:     make(map[string]*breakerState),
@@ -227,8 +233,8 @@ func (bp *BubblesPoller) pushWorker() {
 	defer bp.pushWG.Done()
 	for job := range bp.pushCh {
 		bp.webhooks.Send(job.username, job.current)
-		bp.ntfy.NotifyBubbleIncrease(job.clientID, job.prev, job.current)
-		bp.fcm.NotifyBubbleIncrease(job.clientID, job.prev, job.current)
+		bp.ntfy.NotifyBubbleIncrease(job.clientID, job.prev, job.current, job.fav, job.mentions)
+		bp.fcm.NotifyBubbleIncrease(job.clientID, job.prev, job.current, job.fav, job.mentions)
 	}
 }
 
@@ -430,20 +436,131 @@ func (bp *BubblesPoller) checkOne(clientID string, s *Session, save, refresh boo
 		current.Messages != prev.Messages ||
 		current.Favorites != prev.Favorites
 	bp.prev[clientID] = current
+	trackingFav := len(bp.prevFav[clientID]) > 0
 	bp.stateMu.Unlock()
+
+	// Enrichment (extra MV scrapes to name the thread / mentioning user) only
+	// runs for push-enabled devices, so SSE/web-only clients keep the lighter
+	// path and the aggregate MV request rate stays bounded.
+	var favThreads []ThreadActivity
+	var mentions []MentionActivity
+	if bp.fcm.HasTokens(clientID) {
+		// Favorites: fetch when bf rose OR while we are still tracking unread
+		// favorite threads — extra posts in an ALREADY-unread thread don't bump
+		// bf, and that "3 mensajes nuevos en X" case is exactly the point.
+		if current.Favorites > prev.Favorites || trackingFav {
+			favThreads = bp.enrichFavorites(clientID, scraper)
+		}
+		// Mentions: fetch the feed when bn rose. This marks them seen on MV
+		// (bn→0); enrichMentions mirrors the unseen set into the pending store so
+		// the badge survives, then groups per thread for the push.
+		if current.Notifications > prev.Notifications {
+			mentions = bp.enrichMentions(clientID, scraper, current.Notifications)
+		}
+	}
 
 	if changed {
 		log.Printf("[bubbles] changed (%s): bm=%d→%d bn=%d→%d bf=%d→%d", username,
 			prev.Messages, current.Messages,
 			prev.Notifications, current.Notifications,
 			prev.Favorites, current.Favorites)
-		bp.notifyClient(clientID, current) // SSE — in-process, fast
+		bp.notifyClient(clientID, current) // SSE — in-process, fast (effective bn)
 		scraper.SaveSession()
-		// webhook/ntfy/fcm go async with the prev/current snapshot carried along.
-		bp.enqueuePush(pushJob{clientID: clientID, username: username, prev: prev, current: current})
+	}
+
+	// Push when any counter changed, or when an already-unread favorite thread
+	// gained posts (no bubble change, but favThreads is non-empty).
+	if changed || len(favThreads) > 0 {
+		bp.enqueuePush(pushJob{
+			clientID: clientID, username: username,
+			prev: prev, current: current,
+			fav: favThreads, mentions: mentions,
+		})
 	}
 
 	bp.runCheckMod(clientID, s)
+}
+
+// enrichFavorites scrapes the favorites page and returns the threads whose
+// unread count rose since the last poll (so the push can name the thread and
+// show "N mensajes nuevos en …"). It also updates prevFav so an unchanged
+// thread doesn't re-notify and a fully-read thread is dropped (re-notifies on
+// the next new post). Returns nil on scrape error.
+func (bp *BubblesPoller) enrichFavorites(clientID string, scraper *ForumScraper) []ThreadActivity {
+	favs, err := scraper.FetchFavorites()
+	if err != nil {
+		log.Printf("[bubbles] favorites enrich failed for %s: %v", clientID, err)
+		return nil
+	}
+
+	bp.stateMu.Lock()
+	defer bp.stateMu.Unlock()
+	prevMap := bp.prevFav[clientID]
+	newMap := make(map[string]int)
+
+	var out []ThreadActivity
+	for _, f := range favs {
+		// Only threads with an unread badge are "new activity".
+		if f.URL == "" || f.Title == "" || f.UnreadCount == "" {
+			continue
+		}
+		key := threadKey(f.URL)
+		cnt := parseUnread(f.UnreadCount)
+		newMap[key] = cnt
+		prevCnt, seen := prevMap[key]
+		// Notify on a freshly-unread thread, or one whose count grew. When the
+		// count is unknown ("new", cnt==0) only notify the first time we see it.
+		if !seen || cnt > prevCnt {
+			out = append(out, ThreadActivity{Title: f.Title, URL: f.URL, Key: key, Count: cnt})
+		}
+	}
+	bp.prevFav[clientID] = newMap
+	return out
+}
+
+// enrichMentions fetches the notifications feed (marking everything seen on MV),
+// mirrors the unseen items into the pending store so the in-app badge survives,
+// and returns one MentionActivity per thread with the cumulative unseen count
+// (so the per-thread push can be updated in place as more avisos arrive).
+func (bp *BubblesPoller) enrichMentions(clientID string, scraper *ForumScraper, unread int) []MentionActivity {
+	items, err := scraper.FetchNotifications()
+	if err != nil {
+		log.Printf("[bubbles] mentions enrich failed for %s: %v", clientID, err)
+		return nil
+	}
+	// The feed is newest-first; the first `unread` entries are the unseen ones.
+	if unread > len(items) {
+		unread = len(items)
+	}
+	if unread <= 0 {
+		return nil
+	}
+	unseen := items[:unread]
+	bp.pending.Add(clientID, unseen)
+
+	// Cumulative unseen-per-thread from the durable store (covers avisos from
+	// earlier ticks that the user hasn't opened yet).
+	perThread := bp.pending.CountByThread(clientID)
+
+	// One MentionActivity per thread touched this tick, newest item as the face.
+	seen := make(map[string]bool)
+	var out []MentionActivity
+	for _, it := range unseen {
+		key := threadKey(it.URL)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		cnt := perThread[key]
+		if cnt == 0 {
+			cnt = 1
+		}
+		out = append(out, MentionActivity{
+			Key: key, Author: it.Author, Text: it.Text,
+			Target: it.Target, URL: it.URL, Count: cnt,
+		})
+	}
+	return out
 }
 
 // runCheckMod serializes the mod-tracking work (rare mod users) so its maps stay
@@ -746,7 +863,23 @@ func formatReportAlert(slug string, r *ModReport) string {
 func (bp *BubblesPoller) notifyClient(clientID string, bubbles *Bubbles) {
 	bp.hub.Publish(clientID, "bubbles", map[string]int{
 		"messages":      bubbles.Messages,
-		"notifications": bubbles.Notifications,
+		"notifications": bp.effectiveNotifications(clientID, bubbles.Notifications),
 		"favorites":     bubbles.Favorites,
 	})
+}
+
+// effectiveNotifications is the avisos badge value the app should show: the
+// larger of MV's live bn and our pending mirror. After we enrich (which marks
+// avisos seen on MV → bn=0) the pending count is the source of truth; before
+// the poller has caught up to a fresh aviso, MV's bn is higher. Either way the
+// badge stays correct, and it clears once the app opens the feed (pending
+// cleared) and MV reports 0. nil-safe (pending store may be unconfigured).
+func (bp *BubblesPoller) effectiveNotifications(clientID string, mvBn int) int {
+	if bp.pending == nil {
+		return mvBn
+	}
+	if c := bp.pending.Count(clientID); c > mvBn {
+		return c
+	}
+	return mvBn
 }

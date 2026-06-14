@@ -147,9 +147,13 @@ func main() {
 	watchTokens := NewWatchTokenStore(colmenaStore)
 	fcmSender := NewFCMSender(fcmTokens)
 
+	// Durable mirror of unseen avisos — decouples the in-app badge from MV's bn,
+	// which the poller clears when it fetches /notificaciones to enrich a push.
+	pendingNotifs := NewPendingNotifStore(colmenaStore)
+
 	// Start bubbles poller for SSE/webhook push notifications. Mod-forum
 	// subscriptions are per-user and configured via /mod/forums.
-	poller := NewBubblesPoller(colmenaStore, hub, sessions, webhooks, telegramBot, ntfyPub, fcmSender, modForums)
+	poller := NewBubblesPoller(colmenaStore, hub, sessions, webhooks, telegramBot, ntfyPub, fcmSender, pendingNotifs, modForums)
 	poller.Start()
 
 	// Start session keepalive to prevent cookies from expiring during idle periods
@@ -163,7 +167,7 @@ func main() {
 
 	// REST API mux — everything here requires Authorization: Bearer <token>.
 	apiMux := http.NewServeMux()
-	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, fcmTokens, baseURL)
+	RegisterAPIRoutes(apiMux, sessions, webhooks, modForums, hub, fcmTokens, pendingNotifs, baseURL)
 	RegisterWatchRoutes(apiMux, sessions, watchTokens, baseURL)
 
 	// Per-client API rate limiter (PLAN_SCALE 2.2 / Phase 1). Sits AFTER auth so

@@ -82,41 +82,49 @@ func (n *NtfyPublisher) publish(msg ntfyMessage) {
 
 // NotifyBubbleIncrease sends a push for each counter that went up for a device.
 // Counters going down (the user read them) never notify. No-op when disabled.
-func (n *NtfyPublisher) NotifyBubbleIncrease(clientID string, prev, current *Bubbles) {
+//
+// fav/mentions are the per-thread enrichment from the poller; ntfy reuses the
+// same body text as FCM (via buildActivityPushes) so both channels read alike.
+// ntfy has no collapse-key, so per-thread messages stack rather than replace —
+// acceptable for the secondary channel.
+func (n *NtfyPublisher) NotifyBubbleIncrease(clientID string, prev, current *Bubbles, fav []ThreadActivity, mentions []MentionActivity) {
 	if n == nil || prev == nil || current == nil {
 		return
 	}
 	topic := ntfyTopic(clientID)
 
-	if current.Notifications > prev.Notifications {
-		c := current.Notifications
-		n.publish(ntfyMessage{
+	for _, p := range buildActivityPushes(prev, current, fav, mentions) {
+		msg := ntfyMessage{
 			Topic:    topic,
-			Title:    "Mediavida",
-			Message:  plural(c, "Tienes %d aviso nuevo", "Tienes %d avisos nuevos"),
-			Priority: 4,
-			Tags:     []string{"bell"},
-		})
+			Title:    p.title,
+			Message:  p.body,
+			Priority: ntfyPriority(p.data["type"]),
+			Tags:     []string{ntfyTag(p.data["type"])},
+		}
+		if url := p.data["url"]; url != "" {
+			msg.Click = url
+		}
+		n.publish(msg)
 	}
-	if current.Messages > prev.Messages {
-		c := current.Messages
-		n.publish(ntfyMessage{
-			Topic:    topic,
-			Title:    "Mensajes privados",
-			Message:  plural(c, "Tienes %d mensaje privado nuevo", "Tienes %d mensajes privados nuevos"),
-			Priority: 4,
-			Tags:     []string{"envelope"},
-		})
+}
+
+// ntfyPriority maps a push category to an ntfy priority.
+func ntfyPriority(kind string) int {
+	if kind == "favorite" {
+		return 3
 	}
-	if current.Favorites > prev.Favorites {
-		c := current.Favorites
-		n.publish(ntfyMessage{
-			Topic:    topic,
-			Title:    "Favoritos",
-			Message:  plural(c, "Actividad nueva en %d hilo favorito", "Actividad nueva en %d hilos favoritos"),
-			Priority: 3,
-			Tags:     []string{"star"},
-		})
+	return 4
+}
+
+// ntfyTag maps a push category to an ntfy icon tag.
+func ntfyTag(kind string) string {
+	switch kind {
+	case "favorite":
+		return "star"
+	case "pm":
+		return "envelope"
+	default:
+		return "bell"
 	}
 }
 

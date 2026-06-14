@@ -53,9 +53,15 @@ class NotificationService {
     );
 
     // Foreground messages aren't shown by the OS on Android — render them.
+    // Reuse the backend grouping tag so a second push about the same thread
+    // replaces the first in the tray instead of stacking (matches the
+    // android.notification.tag / apns-collapse-id behaviour used when the app
+    // is backgrounded/closed).
     FirebaseMessaging.onMessage.listen((msg) {
       final n = msg.notification;
-      if (n != null) _showLocal(n.title ?? 'Mediavida', n.body ?? '');
+      if (n != null) {
+        _showLocal(n.title ?? 'Mediavida', n.body ?? '', _groupTag(msg.data));
+      }
     });
 
     // Tapping a push (backgrounded → resumed) or launching from one (terminated)
@@ -139,20 +145,37 @@ class NotificationService {
     }
   }
 
-  Future<void> _showLocal(String title, String body) async {
-    const android = AndroidNotificationDetails(
+  /// Grouping key for a foreground push, mirrored from the backend's data
+  /// payload (`tag` is `f`/`n` + thread id, or a category). Notifications
+  /// sharing a tag collapse onto one another. Falls back to the category, then
+  /// a single shared key so behaviour matches the previous best-effort render.
+  String _groupTag(Map<String, dynamic> data) {
+    final tag = data['tag'];
+    if (tag is String && tag.isNotEmpty) return tag;
+    final type = data['type'];
+    if (type is String && type.isNotEmpty) return type;
+    return 'mv';
+  }
+
+  Future<void> _showLocal(String title, String body, String tag) async {
+    final android = AndroidNotificationDetails(
       'mv_notifications',
       'Avisos de Mediavida',
       channelDescription: 'Avisos, menciones y mensajes privados',
       importance: Importance.high,
       priority: Priority.high,
+      // Same tag → Android replaces the prior notification in place.
+      tag: tag,
     );
     const ios = DarwinNotificationDetails();
+    // A stable id derived from the tag makes show() replace (not stack) repeated
+    // updates about the same thread/category on both platforms.
+    final id = tag.hashCode & 0x7fffffff;
     await _local.show(
-      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      id,
       title,
       body,
-      const NotificationDetails(android: android, iOS: ios),
+      NotificationDetails(android: android, iOS: ios),
     );
   }
 }

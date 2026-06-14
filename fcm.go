@@ -89,6 +89,11 @@ func NewFCMSender(store *FCMTokenStore) *FCMSender {
 
 // fcmV1Message is the FCM HTTP v1 request body. A `notification` block is
 // included so the OS displays it even with the app closed (required on iOS).
+//
+// Grouping: android.notification.tag and the apns-collapse-id header carry a
+// per-thread key, so a second push about the same thread REPLACES the first in
+// the tray (rather than stacking) even with the app closed. The same key rides
+// along in `data` so the foreground handler can mirror that behaviour.
 type fcmV1Message struct {
 	Message struct {
 		Token        string `json:"token"`
@@ -96,13 +101,30 @@ type fcmV1Message struct {
 			Title string `json:"title"`
 			Body  string `json:"body"`
 		} `json:"notification"`
+		Data    map[string]string `json:"data,omitempty"`
 		Android struct {
-			Priority string `json:"priority"`
+			Priority     string             `json:"priority"`
+			Notification *androidNotifBlock `json:"notification,omitempty"`
 		} `json:"android"`
 		APNS struct {
 			Headers map[string]string `json:"headers"`
 		} `json:"apns"`
 	} `json:"message"`
+}
+
+// androidNotifBlock overrides only the Android `tag` (collapse key); title/body
+// stay inherited from the common notification block.
+type androidNotifBlock struct {
+	Tag string `json:"tag,omitempty"`
+}
+
+// pushMsg is one notification to deliver: title/body plus an optional grouping
+// tag and a data payload for the in-app (foreground) renderer.
+type pushMsg struct {
+	title string
+	body  string
+	tag   string            // per-thread grouping key ("" = no grouping)
+	data  map[string]string // mirrored into the FCM data block
 }
 
 const (
@@ -121,13 +143,20 @@ const (
 // sendOne posts a single notification to one token, retrying on transient
 // (429 / 5xx) FCM responses with bounded exponential backoff (honouring a
 // Retry-After header when present), and pruning the token on a 404/400.
-func (f *FCMSender) sendOne(clientID, token, title, body string) {
+func (f *FCMSender) sendOne(clientID, token string, msg pushMsg) {
 	var m fcmV1Message
 	m.Message.Token = token
-	m.Message.Notification.Title = title
-	m.Message.Notification.Body = body
+	m.Message.Notification.Title = msg.title
+	m.Message.Notification.Body = msg.body
+	m.Message.Data = msg.data
 	m.Message.Android.Priority = "high"
 	m.Message.APNS.Headers = map[string]string{"apns-priority": "10"}
+	if msg.tag != "" {
+		m.Message.Android.Notification = &androidNotifBlock{Tag: msg.tag}
+		// apns-collapse-id replaces a prior iOS notification with the same id.
+		// Capped at 64 bytes by APNs; threadKey() keeps it short ("t123456").
+		m.Message.APNS.Headers["apns-collapse-id"] = msg.tag
+	}
 
 	payload, _ := json.Marshal(m) // safe-ignore: marshaling a static struct never fails
 	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", f.projectID)
@@ -233,7 +262,13 @@ func (f *FCMSender) HasTokens(clientID string) bool {
 
 // NotifyBubbleIncrease pushes (via FCM) for each counter that went up. No-op when
 // disabled or the client has no registered tokens.
-func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles) {
+//
+// fav and mentions are the per-thread enrichment computed by the poller: when
+// present, avisos and favoritos are sent as one grouped (replace-in-place) push
+// per thread, naming the thread and showing its count. When enrichment is empty
+// (e.g. the scrape failed) the method falls back to the old count-only push so a
+// real bubble rise is never dropped silently. Private messages stay count-based.
+func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles, fav []ThreadActivity, mentions []MentionActivity) {
 	if f == nil || prev == nil || current == nil {
 		return
 	}
@@ -242,21 +277,7 @@ func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles
 		return
 	}
 
-	type push struct{ title, body string }
-	var pushes []push
-	if current.Notifications > prev.Notifications {
-		pushes = append(pushes, push{"Mediavida",
-			plural(current.Notifications, "Tienes %d aviso nuevo", "Tienes %d avisos nuevos")})
-	}
-	if current.Messages > prev.Messages {
-		pushes = append(pushes, push{"Mensajes privados",
-			plural(current.Messages, "Tienes %d mensaje privado nuevo", "Tienes %d mensajes privados nuevos")})
-	}
-	if current.Favorites > prev.Favorites {
-		pushes = append(pushes, push{"Favoritos",
-			plural(current.Favorites, "Actividad nueva en %d hilo favorito", "Actividad nueva en %d hilos favoritos")})
-	}
-
+	pushes := buildActivityPushes(prev, current, fav, mentions)
 	if len(pushes) == 0 {
 		return
 	}
@@ -265,7 +286,8 @@ func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles
 	// FCM HTTP v1 has no multicast endpoint, so this is the closest we get to a
 	// batch send while staying friendly to FCM rate limits.
 	type job struct {
-		token, title, body string
+		token string
+		msg   pushMsg
 	}
 	jobs := make(chan job)
 	concurrency := fcmMaxConcurrency
@@ -279,18 +301,78 @@ func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				f.sendOne(clientID, j.token, j.title, j.body)
+				f.sendOne(clientID, j.token, j.msg)
 			}
 		}()
 	}
 
 	for _, p := range pushes {
 		for _, t := range tokens {
-			jobs <- job{token: t, title: p.title, body: p.body}
+			jobs <- job{token: t, msg: p}
 		}
 	}
 	close(jobs)
 	wg.Wait()
+}
+
+// buildActivityPushes turns a bubble diff + per-thread enrichment into the set
+// of notifications to deliver. Shared by FCM and ntfy so both render the same
+// text. Each push carries a grouping tag so repeated pushes about the same
+// thread (or category) replace one another in the tray.
+func buildActivityPushes(prev, current *Bubbles, fav []ThreadActivity, mentions []MentionActivity) []pushMsg {
+	var pushes []pushMsg
+
+	// Avisos (mentions/quotes): per-thread when enriched, else count-only.
+	switch {
+	case len(mentions) > 0:
+		for _, m := range mentions {
+			pushes = append(pushes, pushMsg{
+				title: "Avisos",
+				body:  mentionBody(m),
+				tag:   "n" + m.Key,
+				data:  map[string]string{"type": "mention", "url": m.URL, "thread": m.Key, "tag": "n" + m.Key},
+			})
+		}
+	case current.Notifications > prev.Notifications:
+		pushes = append(pushes, pushMsg{
+			title: "Mediavida",
+			body:  plural(current.Notifications, "Tienes %d aviso nuevo", "Tienes %d avisos nuevos"),
+			tag:   "avisos",
+			data:  map[string]string{"type": "mention", "tag": "avisos"},
+		})
+	}
+
+	// Private messages: always count-based (no cheap per-PM context to scrape).
+	if current.Messages > prev.Messages {
+		pushes = append(pushes, pushMsg{
+			title: "Mensajes privados",
+			body:  plural(current.Messages, "Tienes %d mensaje privado nuevo", "Tienes %d mensajes privados nuevos"),
+			tag:   "mensajes",
+			data:  map[string]string{"type": "pm"},
+		})
+	}
+
+	// Favoritos: per-thread when enriched, else count-only.
+	switch {
+	case len(fav) > 0:
+		for _, t := range fav {
+			pushes = append(pushes, pushMsg{
+				title: "Favoritos",
+				body:  favBody(t.Count, t.Title),
+				tag:   "f" + t.Key,
+				data:  map[string]string{"type": "favorite", "url": t.URL, "thread": t.Key, "tag": "f" + t.Key},
+			})
+		}
+	case current.Favorites > prev.Favorites:
+		pushes = append(pushes, pushMsg{
+			title: "Favoritos",
+			body:  plural(current.Favorites, "Actividad nueva en %d hilo favorito", "Actividad nueva en %d hilos favoritos"),
+			tag:   "favoritos",
+			data:  map[string]string{"type": "favorite", "tag": "favoritos"},
+		})
+	}
+
+	return pushes
 }
 
 // dedupTokens returns the input with exact duplicates removed, preserving order.

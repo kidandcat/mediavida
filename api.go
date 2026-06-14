@@ -130,7 +130,7 @@ type webAuthResponse struct {
 }
 
 // RegisterAPIRoutes wires all REST endpoints under the given mux.
-func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *WebhookStore, modForums *ModForumsStore, hub *EventHub, fcmTokens *FCMTokenStore, baseURL string) {
+func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *WebhookStore, modForums *ModForumsStore, hub *EventHub, fcmTokens *FCMTokenStore, pending *PendingNotifStore, baseURL string) {
 	// --- auth ---
 	mux.HandleFunc("POST /auth/login", func(w http.ResponseWriter, r *http.Request) {
 		var req loginRequest
@@ -820,15 +820,18 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 	})
 
 	mux.HandleFunc("GET /notifications", func(w http.ResponseWriter, r *http.Request) {
-		scraper, _ := requireAuthenticated(w, r, sessions)
+		scraper, clientID := requireAuthenticated(w, r, sessions)
 		if scraper == nil {
 			return
 		}
 		// Capture the unread count BEFORE fetching: visiting /notificaciones
 		// marks everything seen, so afterwards the bubble would read 0. The
 		// newest `unread` items are the unseen ones (feed is newest-first).
-		unread := 0
-		if b, err := scraper.FetchBubbles(); err == nil {
+		// The badge is decoupled from MV's bn (the poller may have already
+		// marked avisos seen while enriching a push), so take the larger of
+		// MV's live count and our pending mirror.
+		unread := pending.Count(clientID)
+		if b, err := scraper.FetchBubbles(); err == nil && b.Notifications > unread {
 			unread = b.Notifications
 		}
 		var items []NotificationItem
@@ -841,9 +844,15 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeAPIError(w, err)
 			return
 		}
+		if unread > len(items) {
+			unread = len(items)
+		}
 		for i := range items {
 			items[i].Unseen = i < unread
 		}
+		// The user is now looking at the feed — drop the pending mirror so the
+		// badge clears (MV already marked them seen on the fetch above).
+		pending.Clear(clientID)
 		scraper.AutoSave()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"unread":        unread,
@@ -853,7 +862,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 
 	// --- bubbles / events / webhook ---
 	mux.HandleFunc("GET /bubbles", func(w http.ResponseWriter, r *http.Request) {
-		scraper, _ := requireAuthenticated(w, r, sessions)
+		scraper, clientID := requireAuthenticated(w, r, sessions)
 		if scraper == nil {
 			return
 		}
@@ -870,9 +879,16 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeAPIError(w, err)
 			return
 		}
+		// Avisos badge is decoupled from MV's bn: take the larger of MV's live
+		// count and our pending mirror (the poller may have marked avisos seen
+		// while enriching a push). Cleared when the app opens /notifications.
+		notifications := b.Notifications
+		if c := pending.Count(clientID); c > notifications {
+			notifications = c
+		}
 		writeJSON(w, http.StatusOK, map[string]int{
 			"messages":      b.Messages,
-			"notifications": b.Notifications,
+			"notifications": notifications,
 			"favorites":     b.Favorites,
 		})
 	})

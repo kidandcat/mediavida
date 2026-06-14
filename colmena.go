@@ -126,6 +126,19 @@ func (cs *ColmenaStore) migrate() error {
 			token     TEXT NOT NULL,
 			PRIMARY KEY (client_id, token)
 		)`,
+		// pending_notifs decouples the in-app "avisos" badge from MV's bn
+		// counter. Enriching a mention push requires fetching /notificaciones,
+		// which marks everything seen on MV (bn→0) before the user has looked.
+		// We mirror the unseen items here so the badge — and the per-thread push
+		// count — survive that side effect; the rows are cleared when the app
+		// opens the notifications feed.
+		`CREATE TABLE IF NOT EXISTS pending_notifs (
+			client_id  TEXT NOT NULL,
+			notif_id   TEXT NOT NULL,
+			url        TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (client_id, notif_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS webhooks (
 			username TEXT PRIMARY KEY,
 			url      TEXT NOT NULL
@@ -281,6 +294,51 @@ func (cs *ColmenaStore) GetFCMTokens(clientID string) ([]string, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// --- pending notifications (Raft) ---
+
+// AddPendingNotif mirrors one unseen MV notification into the pending set
+// (deduped by its MV id). created_at is supplied by the caller so the row is
+// deterministic across Raft replicas.
+func (cs *ColmenaStore) AddPendingNotif(clientID, notifID, url string, createdAt int64) error {
+	_, err := cs.db.Exec(
+		`INSERT OR IGNORE INTO pending_notifs (client_id, notif_id, url, created_at) VALUES (?, ?, ?, ?)`,
+		clientID, notifID, url, createdAt)
+	return err
+}
+
+// CountPendingNotifs returns how many unseen notifications are mirrored for a client.
+func (cs *ColmenaStore) CountPendingNotifs(clientID string) (int, error) {
+	var n int
+	err := cs.db.QueryRow(`SELECT COUNT(*) FROM pending_notifs WHERE client_id = ?`, clientID).Scan(&n)
+	return n, err
+}
+
+// PendingNotifURLs returns the post URLs of every mirrored unseen notification
+// (used to group the per-thread push count).
+func (cs *ColmenaStore) PendingNotifURLs(clientID string) ([]string, error) {
+	rows, err := cs.db.Query(`SELECT url FROM pending_notifs WHERE client_id = ?`, clientID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }() // safe-ignore: best-effort cursor close
+	var out []string
+	for rows.Next() {
+		var u string
+		if serr := rows.Scan(&u); serr != nil {
+			return nil, serr
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// ClearPendingNotifs drops every mirrored notification for a client (called when
+// the app opens the notifications feed, which also marks them seen on MV).
+func (cs *ColmenaStore) ClearPendingNotifs(clientID string) error {
+	_, err := cs.db.Exec(`DELETE FROM pending_notifs WHERE client_id = ?`, clientID)
+	return err
 }
 
 // --- durable webhooks (Raft) ---

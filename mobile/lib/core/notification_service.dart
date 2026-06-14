@@ -3,7 +3,7 @@ import 'dart:math';
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 
@@ -19,7 +19,7 @@ Future<void> _firebaseBackgroundHandler(RemoteMessage message) async {}
 /// Push notifications via FCM. Registers the device's FCM token with the backend
 /// (tied to the device bearer token) and renders foreground messages as local
 /// notifications. Background/closed delivery is handled by the OS via APNs/FCM.
-class NotificationService {
+class NotificationService with WidgetsBindingObserver {
   static final NotificationService _instance = NotificationService._internal();
   factory NotificationService() => _instance;
   NotificationService._internal();
@@ -64,12 +64,27 @@ class NotificationService {
       }
     });
 
-    // Tapping a push (backgrounded → resumed) or launching from one (terminated)
-    // should clear the tray so the same notification doesn't linger — most
-    // visibly on iOS, where delivered notifications stay in Notification Center.
-    final initial = await FirebaseMessaging.instance.getInitialMessage();
-    if (initial != null) await clearDelivered();
+    // Clear the tray when the app comes to the foreground, from ANY screen.
+    // A global lifecycle observer (rather than a per-screen one) is needed
+    // because returning to the foreground while on a thread/other screen must
+    // still clear notifications.
+    WidgetsBinding.instance.addObserver(this);
+
+    // Clear on launch regardless of HOW the app was opened. Tapping a push
+    // fires getInitialMessage / onMessageOpenedApp, but opening from the
+    // launcher icon (cold start) fires neither and does NOT emit a `resumed`
+    // lifecycle event — that was the case leaving FCM notifications stuck in
+    // the tray. An unconditional clear here covers it.
     FirebaseMessaging.onMessageOpenedApp.listen((_) => clearDelivered());
+    await clearDelivered();
+  }
+
+  /// Returning to the foreground means the user has seen their activity — drop
+  /// anything still in the tray, including notifications the OS rendered from an
+  /// FCM `notification` payload while the app was backgrounded or closed.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) clearDelivered();
   }
 
   /// Clear all delivered notifications from the tray / Notification Center and

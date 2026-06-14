@@ -6,12 +6,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/models.dart';
 import '../core/notification_service.dart';
+import '../core/watch_pairing_server.dart';
 import '../state/providers.dart';
 import 'favorites_screen.dart';
 import 'forum_index_screen.dart';
 import 'inbox_screen.dart';
 import 'notifications_screen.dart';
-import 'search_screen.dart';
 
 /// Bottom-nav shell. Tabs are kept alive via IndexedStack.
 class HomeScreen extends ConsumerStatefulWidget {
@@ -40,7 +40,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
     FavoritesScreen(),
     NotificationsScreen(),
     InboxScreen(),
-    SearchScreen(),
   ];
 
   @override
@@ -50,9 +49,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
     // Drop to login if the backend session is gone (redeploy / expiry).
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(configProvider.notifier).verifySession();
+      _ensureWatchPairing();
     });
     // Poll the notification counters so badges clear after reading.
     _scheduleNextPoll();
+  }
+
+  /// Keeps the ambient watch-pairing loopback server bound while the app is
+  /// open, so a watch whose token got rejected can silently re-pair the moment
+  /// the user opens the app (no manual un-pair/re-pair needed).
+  void _ensureWatchPairing() {
+    final api = ref.read(apiProvider);
+    if (api != null) WatchPairingHub.instance.ensureRunning(api);
   }
 
   @override
@@ -70,6 +78,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
       _pollFailures = 0;
       _pollNow();
       ref.read(configProvider.notifier).verifySession();
+      _ensureWatchPairing();
       // Returning to the foreground (e.g. after tapping a push) clears the tray.
       NotificationService().clearDelivered();
     }
@@ -134,8 +143,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> with WidgetsBindingObse
           _dest(Icons.star_border, Icons.star, 'Favoritos', b.favorites),
           _dest(Icons.notifications_none, Icons.notifications, 'Avisos', b.notifications),
           _dest(Icons.mail_outline, Icons.mail, 'MPs', b.messages),
-          const NavigationDestination(
-              icon: Icon(Icons.search), selectedIcon: Icon(Icons.search), label: 'Buscar'),
         ],
       ),
     );

@@ -8,13 +8,15 @@ import '../api/mv_api.dart';
 
 /// Localhost handshake server for pairing an Amazfit watchface.
 ///
-/// While pairing is active the Flutter app runs this tiny HTTP server bound to
-/// loopback. The watch's Zepp side-service fetches `GET /pair` once (with the
-/// shared app-key header) to receive a watch token minted by the backend. After
-/// that the watch talks to the backend directly and autonomously.
+/// The Flutter app runs this tiny HTTP server bound to loopback whenever it is
+/// in the foreground (see [WatchPairingHub.ensureRunning]). The watch's Zepp
+/// side-service fetches `GET /pair` (with the shared app-key header) to receive
+/// a watch token minted by the backend — on first pairing AND as a silent
+/// self-heal whenever its stored token gets a 401. After that the watch talks
+/// to the backend directly and autonomously.
 ///
 /// The contract here is matched exactly by the watch side — do not change the
-/// port, path, header name or app key without updating the watch app too.
+/// port, path, header names or app key without updating the watch app too.
 class WatchPairingServer {
   WatchPairingServer(this._api, {this.onPaired});
 
@@ -27,13 +29,20 @@ class WatchPairingServer {
   /// Header the watch must send (shared secret between this app and the watch).
   static const String appKeyHeader = 'X-Watch-App-Key';
 
+  /// Optional header carrying the token this pair replaces (watch self-heal
+  /// after a 401). Forwarded to the backend so it revokes the old token and the
+  /// paired-watches list keeps one entry per physical watch.
+  static const String oldTokenHeader = 'X-Watch-Old-Token';
+
   /// Shared key the watch presents. Must equal what the watch side is built with.
   static const String appKey = '70f54fb484323ae9c7fcaff542bcfda8';
 
   /// Label applied to watches paired through this handshake.
   static const String watchLabel = 'Amazfit';
 
-  final MvApi _api;
+  /// Getter, not an instance: the server is long-lived (ambient) and must
+  /// always use the current API client.
+  final MvApi? Function() _api;
 
   /// Invoked after a successful `/pair` handshake, so the UI can refresh the
   /// paired-watches list and show a confirmation.
@@ -44,7 +53,7 @@ class WatchPairingServer {
   bool get isRunning => _server != null;
 
   /// Starts the loopback server. Rethrows the [SocketException] if the port is
-  /// already in use (e.g. pairing was started twice) so the caller can surface it.
+  /// already in use (e.g. another app instance) so the caller can surface it.
   Future<void> start() async {
     if (_server != null) return;
     final server =
@@ -81,8 +90,16 @@ class WatchPairingServer {
         response.write(jsonEncode({'error': 'forbidden'}));
         return;
       }
-      final result = await _api.pairWatch(label: watchLabel);
-      debugPrint('[WatchPairing] paired ✓ token=${result.token.substring(0, 8)}…');
+      final api = _api();
+      if (api == null) {
+        response.statusCode = HttpStatus.serviceUnavailable;
+        response.write(jsonEncode({'error': 'app not logged in'}));
+        return;
+      }
+      final replaces = request.headers.value(oldTokenHeader);
+      final result = await api.pairWatch(label: watchLabel, replaces: replaces);
+      debugPrint('[WatchPairing] paired ✓ token=${result.token.substring(0, 8)}…'
+          '${replaces != null ? ' (replaces ${replaces.substring(0, 8)}…)' : ''}');
       response.statusCode = HttpStatus.ok;
       response.write(jsonEncode({
         'token': result.token,
@@ -99,73 +116,102 @@ class WatchPairingServer {
   }
 }
 
-/// Status of the app-scoped pairing window.
+/// Status of the UI pairing window (purely informative — the server itself is
+/// ambient and outlives the window).
 enum PairingPhase { idle, waiting, paired, error }
 
 class PairingState {
   const PairingState(this.phase, {this.until, this.message});
   final PairingPhase phase;
-  final DateTime? until; // when the active window auto-closes
+  final DateTime? until; // when the active UI window auto-closes
   final String? message;
 
   static const idle = PairingState(PairingPhase.idle);
 }
 
-/// App-scoped owner of the pairing server, so it survives leaving the Relojes
-/// screen and the app being backgrounded (the Dart isolate keeps running while
-/// the user switches to the Zepp app to open the watch mini-app). The server is
-/// only torn down when the pairing window elapses, on success, or explicitly —
-/// NOT when the screen is disposed. This is what makes the loopback handshake
-/// reachable during the window the watch actually fetches.
+/// App-scoped owner of the pairing server.
+///
+/// The server is AMBIENT: [ensureRunning] binds it as soon as the app has a
+/// logged-in API client (home screen init/resume) and it stays up while the
+/// app lives. This is what lets a watch whose token got rejected self-heal
+/// silently — "open the Mediavida app" is all the user has to do; no manual
+/// un-pair/re-pair dance. Android freezes the isolate in the background, so in
+/// practice the loopback endpoint is reachable while the app is foregrounded
+/// (exactly when the user follows the watch's instruction to open the app).
+///
+/// The "pairing window" ([openWindow]/[closeWindow]) is ONLY UI state for the
+/// Relojes screen's first-pairing flow (countdown + confirmation); it does not
+/// start or stop the server.
 class WatchPairingHub {
   WatchPairingHub._();
   static final WatchPairingHub instance = WatchPairingHub._();
 
   WatchPairingServer? _server;
-  Timer? _autoStop;
+  Timer? _windowTimer;
+  MvApi? _currentApi;
 
   /// Observable state for the UI.
   final ValueNotifier<PairingState> state = ValueNotifier(PairingState.idle);
 
   bool get active => _server != null;
 
-  /// Opens a pairing window: binds the loopback server and keeps it up for
-  /// [window]. Safe to call repeatedly (re-arms the window).
-  Future<void> start(MvApi api,
-      {Duration window = const Duration(minutes: 5)}) async {
-    _autoStop?.cancel();
-    if (_server == null) {
-      final server = WatchPairingServer(api, onPaired: _onPaired);
-      try {
-        await server.start();
-      } on SocketException catch (e) {
-        state.value = PairingState(PairingPhase.error,
-            message: 'No se pudo abrir el emparejamiento (puerto en uso).');
-        debugPrint('[WatchPairing] bind failed: $e');
-        return;
-      }
+  /// Binds the ambient loopback server (idempotent) and refreshes the API
+  /// client it mints tokens with. Call whenever a logged-in screen appears or
+  /// the app resumes.
+  Future<void> ensureRunning(MvApi api) async {
+    _currentApi = api;
+    if (_server != null) return;
+    final server = WatchPairingServer(() => _currentApi, onPaired: _onPaired);
+    try {
+      await server.start();
       _server = server;
+    } on SocketException catch (e) {
+      // Port taken (another instance?) — not fatal: explicit pairing will
+      // surface the error via openWindow, and we retry on the next resume.
+      debugPrint('[WatchPairing] ambient bind failed: $e');
+    }
+  }
+
+  /// Opens the UI pairing window: makes sure the server is up and shows the
+  /// waiting/countdown state for [window]. Safe to call repeatedly (re-arms).
+  Future<void> openWindow(MvApi api,
+      {Duration window = const Duration(minutes: 5)}) async {
+    _windowTimer?.cancel();
+    await ensureRunning(api);
+    if (_server == null) {
+      state.value = const PairingState(PairingPhase.error,
+          message: 'No se pudo abrir el emparejamiento (puerto en uso).');
+      return;
     }
     final until = DateTime.now().add(window);
     state.value = PairingState(PairingPhase.waiting, until: until);
-    _autoStop = Timer(window, stop);
+    _windowTimer = Timer(window, closeWindow);
   }
 
-  void _onPaired() {
-    state.value = const PairingState(PairingPhase.paired);
-    // Keep the server up briefly in case the watch retries, then close it.
-    _autoStop?.cancel();
-    _autoStop = Timer(const Duration(seconds: 30), stop);
-  }
-
-  Future<void> stop() async {
-    _autoStop?.cancel();
-    _autoStop = null;
-    final s = _server;
-    _server = null;
-    await s?.stop();
+  /// Closes the UI window (countdown). The ambient server keeps running.
+  void closeWindow() {
+    _windowTimer?.cancel();
+    _windowTimer = null;
     if (state.value.phase != PairingPhase.paired) {
       state.value = PairingState.idle;
     }
+  }
+
+  void _onPaired() {
+    _windowTimer?.cancel();
+    _windowTimer = null;
+    state.value = const PairingState(PairingPhase.paired);
+  }
+
+  /// Full teardown (logout). Ambient pairing stops until the next
+  /// [ensureRunning].
+  Future<void> stop() async {
+    _windowTimer?.cancel();
+    _windowTimer = null;
+    _currentApi = null;
+    final s = _server;
+    _server = null;
+    await s?.stop();
+    state.value = PairingState.idle;
   }
 }

@@ -34,15 +34,20 @@ export const BUBBLES_PATH = '/bubbles'
  * Perform the localhost pairing handshake.
  *
  * Resolves with `{ token, baseUrl }` on success. Rejects when the phone app is
- * not reachable (pairing screen not open) or returns a non-2xx status. The
- * companion should surface "Abre la app de Mediavida para emparejar" on reject
- * and retry on the next cycle.
+ * not reachable (not foregrounded) or returns a non-2xx status. The companion
+ * keeps any stored credentials on reject and retries on the next cycle.
+ *
+ * `oldToken` (optional) is the token being replaced — sent as
+ * `X-Watch-Old-Token` so the backend revokes it after minting the new one,
+ * keeping the phone's paired-watches list at one entry per physical watch.
  */
-export function pair() {
+export function pair(oldToken) {
+  const headers = { 'X-Watch-App-Key': WATCH_APP_KEY }
+  if (oldToken) headers['X-Watch-Old-Token'] = oldToken
   return fetch({
     url: PAIR_URL,
     method: 'GET',
-    headers: { 'X-Watch-App-Key': WATCH_APP_KEY },
+    headers,
   }).then((res) => {
     const status = res.status || 200
     if (status < 200 || status >= 300) {
@@ -63,9 +68,11 @@ export function pair() {
  * the watchface's historic field names `{ bm, bn, bf }` here, so the watchface
  * rendering code stays unchanged.
  *
- * On HTTP 401 the token is no longer valid (revoked / session gone): we surface
- * a `{ unauthorized: true }` marker so the caller can clear the stored token and
- * re-pair next cycle. Other failures reject so the caller keeps the last data.
+ * On HTTP 401 the token was rejected (revoked, or the backend session is
+ * momentarily gone): we surface a `{ unauthorized: true }` marker so the caller
+ * can attempt an opportunistic re-pair — WITHOUT discarding the stored token,
+ * since a 401 can be transient and the token may work again on the next cycle.
+ * Other failures reject so the caller keeps the last data.
  */
 export function fetchBubbles(token, baseUrl) {
   return fetch({

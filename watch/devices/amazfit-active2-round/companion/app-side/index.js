@@ -29,6 +29,20 @@ import { pair, fetchBubbles } from '../shared/bubbles'
 
 const messageBuilder = new MessageBuilder()
 
+// Run the localhost handshake and fetch with the freshly-minted credentials.
+// `oldToken` (if any) is handed to the phone so the backend revokes it.
+function pairAndFetch(oldToken) {
+  return pair(oldToken).then((creds) => {
+    return fetchBubbles(creds.token, creds.baseUrl).then((data) => {
+      if (data && data.unauthorized) {
+        // Brand-new token already rejected — surface as needing re-pair.
+        return { needPair: true }
+      }
+      return { result: data, paired: creds }
+    })
+  })
+}
+
 // Resolve bubbles for a request, pairing first if needed. Always resolves
 // (never rejects) with a plain object the page can act on.
 function handleGetBubbles(payload) {
@@ -40,7 +54,15 @@ function handleGetBubbles(payload) {
     return fetchBubbles(token, baseUrl)
       .then((data) => {
         if (data && data.unauthorized) {
-          return { unauthorized: true }
+          // Token rejected. SELF-HEAL: try a silent re-pair right now (works
+          // whenever the Mediavida app is foregrounded — its loopback server is
+          // ambient). On success the page atomically replaces its credentials;
+          // on failure it KEEPS the old token (the 401 may be transient) and
+          // just reports the state. Never destroy credentials on a 401.
+          return pairAndFetch(token).catch((err) => {
+            console.log('re-pair after 401 failed: ' + err)
+            return { unauthorized: true }
+          })
         }
         return { result: data }
       })
@@ -50,22 +72,12 @@ function handleGetBubbles(payload) {
       })
   }
 
-  // No credentials yet: run the one-time localhost handshake, then fetch.
-  return pair()
-    .then((creds) => {
-      return fetchBubbles(creds.token, creds.baseUrl).then((data) => {
-        if (data && data.unauthorized) {
-          // Brand-new token already rejected — surface as needing re-pair.
-          return { needPair: true }
-        }
-        return { result: data, paired: creds }
-      })
-    })
-    .catch((err) => {
-      // Most common cause: phone app / pairing screen not open.
-      console.log('pair handshake failed: ' + err)
-      return { needPair: true }
-    })
+  // No credentials yet (first run): localhost handshake, then fetch.
+  return pairAndFetch(null).catch((err) => {
+    // Most common cause: phone app not open.
+    console.log('pair handshake failed: ' + err)
+    return { needPair: true }
+  })
 }
 
 AppSideService({

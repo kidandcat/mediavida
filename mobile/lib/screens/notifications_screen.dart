@@ -6,6 +6,7 @@ import '../router.dart';
 import '../state/providers.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
+import '../widgets/subforos_title.dart';
 
 /// Index of the "Avisos" tab in the bottom nav (see HomeScreen._tabs).
 const _avisosTabIndex = 2;
@@ -54,14 +55,8 @@ class NotificationsScreen extends ConsumerWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Avisos'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Actualizar',
-            onPressed: () => ref.invalidate(notificationsProvider),
-          ),
-        ],
+        title: const SubforosTitle(),
+        actions: profileBarActions(context),
       ),
       body: body,
     );

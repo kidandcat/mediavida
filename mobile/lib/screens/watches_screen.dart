@@ -62,7 +62,7 @@ class _WatchesScreenState extends ConsumerState<WatchesScreen> {
   void _startPairing() {
     final api = ref.read(apiProvider);
     if (api == null) return;
-    WatchPairingHub.instance.start(api);
+    WatchPairingHub.instance.openWindow(api);
     setState(() {});
   }
 
@@ -180,7 +180,10 @@ class _WatchesScreenState extends ConsumerState<WatchesScreen> {
           '(ventana ${secs}s)';
       spinner = true;
       action = TextButton(
-          onPressed: () => WatchPairingHub.instance.stop().then((_) => setState(() {})),
+          onPressed: () {
+            WatchPairingHub.instance.closeWindow();
+            setState(() {});
+          },
           child: const Text('Detener'));
     } else if (paired) {
       icon = Icons.check_circle;

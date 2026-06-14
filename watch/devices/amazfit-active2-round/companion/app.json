@@ -5,8 +5,8 @@
     "appName": "MV Companion",
     "appType": "app",
     "version": {
-      "code": 1,
-      "name": "1.0.0"
+      "code": 2,
+      "name": "1.0.1"
     },
     "icon": "icon.png",
     "vender": "jairo",
@@ -20,21 +20,34 @@
     },
     "type": 0
   },
-  "permissions": ["data:os.device.info"],
+  "permissions": [
+    "data:os.device.info"
+  ],
   "targets": {
     "amazfit-active2-round": {
       "module": {
         "page": {
-          "pages": ["page/index"]
+          "pages": [
+            "page/index"
+          ]
         },
         "app-side": {
           "path": "app-side/index"
         }
       },
       "platforms": [
-        { "name": "amazfit-active2-round", "deviceSource": 8913153 },
-        { "name": "amazfit-active2-round-alt", "deviceSource": 8913155 },
-        { "name": "amazfit-active2-round-alt2", "deviceSource": 8913159 }
+        {
+          "name": "amazfit-active2-round",
+          "deviceSource": 8913153
+        },
+        {
+          "name": "amazfit-active2-round-alt",
+          "deviceSource": 8913155
+        },
+        {
+          "name": "amazfit-active2-round-alt2",
+          "deviceSource": 8913159
+        }
       ],
       "designWidth": 480
     }

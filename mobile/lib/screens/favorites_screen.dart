@@ -5,6 +5,7 @@ import '../state/providers.dart';
 import '../router.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
+import '../widgets/subforos_title.dart';
 
 final _favoritesProvider =
     FutureProvider.autoDispose<List<ThreadListItem>>((ref) async {
@@ -21,14 +22,8 @@ class FavoritesScreen extends ConsumerWidget {
     final favorites = ref.watch(_favoritesProvider);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Favoritos'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Actualizar',
-            onPressed: () => ref.invalidate(_favoritesProvider),
-          ),
-        ],
+        title: const SubforosTitle(),
+        actions: profileBarActions(context),
       ),
       body: favorites.when(
         loading: () => const LoadingView(),

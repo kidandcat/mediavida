@@ -8,10 +8,13 @@
  *   - data.json  : { bm, bn, bf, ts }   the counters the watchface reads
  *   - alarm.json : { id }               the pending refresh alarm id
  *
- * On each run it: reads pair.json, asks the app-side for fresh bubbles (passing
- * the stored credentials, if any), persists the result, schedules the next
- * alarm, and returns home. The app-side does the localhost pairing handshake the
- * first time (no stored token); we persist whatever credentials it mints back.
+ * On each run it: schedules the next alarm (first thing, so the chain never
+ * breaks), reads pair.json, asks the app-side for fresh bubbles (passing the
+ * stored credentials, if any), persists the result, and returns home. The
+ * app-side does the localhost pairing handshake on first run (no stored token)
+ * and as a silent SELF-HEAL whenever the backend rejects the token (401); we
+ * persist whatever credentials it mints back. Stored credentials are only ever
+ * replaced by working ones — never deleted on errors.
  */
 import { createWidget, widget, align, prop, text_style } from '@zos/ui'
 import { px } from '@zos/utils'
@@ -60,6 +63,12 @@ Page({
       text_style: text_style.WRAP,
     })
 
+    // Re-arm the refresh chain UNCONDITIONALLY, before anything that can fail.
+    // If this only ran on the fetch path, a single run where the MessageBuilder
+    // handshake fails (phone out of BLE range, Zepp app killed) would silently
+    // kill the alarm chain and the counters would go stale forever.
+    this.scheduleNextAlarm()
+
     this.waitAndFetch(0)
   },
 
@@ -106,11 +115,6 @@ Page({
       this.setStatus('Write err: ' + String(e).slice(0, 40))
     }
     return false
-  },
-
-  clearPair() {
-    // Overwrite pair.json with an empty object so the next cycle re-pairs.
-    this.writeJsonFile(PAIR_FILE, {})
   },
 
   // writeStatus persists the connection status into data.json WITHOUT clobbering
@@ -171,11 +175,10 @@ Page({
   },
 
   fetchData(mb) {
-    // Schedule the next alarm FIRST so the refresh chain never breaks, even if
-    // the network step throws.
-    this.scheduleNextAlarm()
+    // (Next alarm already scheduled at build() — chain never depends on this
+    // method being reached.)
 
-    // Load stored credentials (may be null on first run / after a 401 reset).
+    // Load stored credentials (null only on first run — a 401 never clears them).
     const creds = this.readJsonFile(PAIR_FILE)
     const hasToken = creds && creds.token && creds.baseUrl
 
@@ -197,12 +200,15 @@ Page({
           return
         }
 
-        // Token was rejected by the backend — drop it so we re-pair next cycle.
+        // Token rejected AND the silent re-pair didn't go through (phone app
+        // not open). KEEP the stored credentials — the 401 may be transient,
+        // and the app-side will retry the self-heal on every cycle. Opening
+        // the Mediavida app (its loopback server is ambient) is enough to fix
+        // it on the next refresh or a tap on the logo.
         if (data.unauthorized) {
-          this.clearPair()
           this.writeStatus('unauth')
-          this.setStatus('Sesion caducada,\nreabriendo emparejamiento')
-          this.goBack(2500)
+          this.setStatus('Sesion invalida.\nAbre la app de Mediavida\ny toca el logo')
+          this.goBack(3000)
           return
         }
 
@@ -222,7 +228,10 @@ Page({
           return
         }
 
-        // Persist freshly-minted credentials from a first-time handshake.
+        // Persist freshly-minted credentials — from the first-time handshake
+        // OR from a successful self-heal re-pair after a 401. This is the ONLY
+        // way stored credentials change: atomically replaced by working ones,
+        // never deleted first.
         if (data.paired && data.paired.token && data.paired.baseUrl) {
           this.writeJsonFile(PAIR_FILE, {
             token: data.paired.token,

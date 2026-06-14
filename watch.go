@@ -54,6 +54,10 @@ func (s *WatchTokenStore) Delete(token string) {
 
 type watchPairRequest struct {
 	Label string `json:"label,omitempty"`
+	// Replaces is the token this pair supersedes (a watch re-pairing after a
+	// 401 self-heal). It is revoked after the new token is minted, so the
+	// owner's watch list keeps one entry per physical watch.
+	Replaces string `json:"replaces,omitempty"`
 }
 
 type watchPairResponse struct {
@@ -91,6 +95,18 @@ func RegisterWatchRoutes(mux *http.ServeMux, sessions *SessionStore, watch *Watc
 		}
 		label := strings.TrimSpace(req.Label)
 		watch.Add(token, owner, label)
+
+		// Revoke the superseded token AFTER the new one is registered, and only
+		// if it really belongs to this owner (never let a caller revoke someone
+		// else's token). Best-effort: a failure here just leaves a zombie entry
+		// the user can prune from the watches screen.
+		if old := strings.TrimSpace(req.Replaces); old != "" && old != token {
+			if tokenOwner, ok := watch.Owner(old); ok && tokenOwner == owner {
+				watch.Delete(old)
+				log.Printf("[watch] revoked replaced token for %s", owner)
+			}
+		}
+
 		log.Printf("[watch] paired new watch for %s (label %q)", owner, label)
 		writeJSON(w, http.StatusOK, watchPairResponse{Token: token, BaseURL: baseURL})
 	})

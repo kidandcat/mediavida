@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../api/models.dart';
 import '../api/mv_api.dart';
 import '../core/config.dart';
+import '../core/watch_pairing_server.dart';
 
 /// Index of the currently selected bottom-nav tab. Lets a tab kept alive by
 /// IndexedStack know whether it is actually on screen (e.g. to avoid loading
@@ -62,6 +63,9 @@ class ConfigNotifier extends Notifier<AppConfig?> {
   }
 
   Future<void> signOut() async {
+    // Explicit sign-out: tear down the ambient watch-pairing server too (a
+    // logged-out app must not mint watch tokens).
+    await WatchPairingHub.instance.stop();
     try {
       await ref.read(apiProvider)?.logout();
     } catch (_) {}
@@ -107,6 +111,14 @@ final forumsProvider = FutureProvider<List<ForumCategory>>((ref) async {
   final api = ref.watch(apiProvider);
   if (api == null) return [];
   return api.forums();
+});
+
+/// The logged-in user's Mediavida profile (avatar, rank, counters, ...).
+/// autoDispose so opening the profile screen refetches fresh stats.
+final profileProvider = FutureProvider.autoDispose<Profile?>((ref) async {
+  final api = ref.watch(apiProvider);
+  if (api == null) return null;
+  return api.profile();
 });
 
 /// Current notification counters, refreshed on demand and via [bubblesStreamProvider].

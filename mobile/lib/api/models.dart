@@ -423,3 +423,43 @@ class Bubbles {
       );
   int get total => messages + notifications + favorites;
 }
+
+/// The logged-in user's Mediavida profile (GET /profile).
+class Profile {
+  final String username;
+  final String avatar;
+  final String cover;
+  final String rank;
+  final String registered;
+  final int posts;
+  final int threads;
+  final int visits;
+  final String bio;
+  final bool online;
+
+  const Profile({
+    this.username = '',
+    this.avatar = '',
+    this.cover = '',
+    this.rank = '',
+    this.registered = '',
+    this.posts = 0,
+    this.threads = 0,
+    this.visits = 0,
+    this.bio = '',
+    this.online = false,
+  });
+
+  factory Profile.fromJson(Map<String, dynamic> j) => Profile(
+        username: _s(j['username']),
+        avatar: _s(j['avatar']),
+        cover: _s(j['cover']),
+        rank: _s(j['rank']),
+        registered: _s(j['registered']),
+        posts: _i(j['posts']),
+        threads: _i(j['threads']),
+        visits: _i(j['visits']),
+        bio: _s(j['bio']),
+        online: _b(j['online']),
+      );
+}

@@ -7,10 +7,10 @@ import '../router.dart';
 import '../state/providers.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
-import '../widgets/forum_icon.dart';
+import '../widgets/subforos_title.dart';
 
 /// Home tab: the Mediavida portada (featured-thread feed). Subforums are reached
-/// through a dropdown, like the website.
+/// through the dropdown in the app bar, like the website.
 class ForumIndexScreen extends ConsumerWidget {
   const ForumIndexScreen({super.key});
 
@@ -20,25 +20,8 @@ class ForumIndexScreen extends ConsumerWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Portada'),
-        actions: [
-          TextButton.icon(
-            onPressed: () => _showSubforums(context, ref),
-            icon: const Icon(Icons.menu, size: 20),
-            label: const Text('Subforos'),
-            style: TextButton.styleFrom(foregroundColor: context.scheme.primary),
-          ),
-          IconButton(
-            icon: const Icon(Icons.watch),
-            tooltip: 'Relojes',
-            onPressed: () => context.openWatches(),
-          ),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Cerrar sesión',
-            onPressed: () => ref.read(configProvider.notifier).signOut(),
-          ),
-        ],
+        title: const SubforosTitle(),
+        actions: profileBarActions(context),
       ),
       body: RefreshIndicator(
         onRefresh: () async => ref.invalidate(portadaProvider),
@@ -59,67 +42,6 @@ class ForumIndexScreen extends ConsumerWidget {
         ),
       ),
     );
-  }
-
-  Future<void> _showSubforums(BuildContext context, WidgetRef ref) async {
-    // Load the forum index, then drop a menu down from the app bar (like the web).
-    List<ForumCategory> cats;
-    try {
-      cats = await ref.read(forumsProvider.future);
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
-      }
-      return;
-    }
-    if (!context.mounted) return;
-
-    final items = <PopupMenuEntry<ForumInfo>>[];
-    for (final cat in cats) {
-      items.add(PopupMenuItem<ForumInfo>(
-        enabled: false,
-        height: 30,
-        child: Text(
-          cat.name.toUpperCase(),
-          style: TextStyle(
-            color: context.scheme.primary,
-            fontSize: 11.5,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 0.5,
-          ),
-        ),
-      ));
-      for (final forum in cat.forums) {
-        items.add(PopupMenuItem<ForumInfo>(
-          value: forum,
-          height: 42,
-          child: Row(
-            children: [
-              ForumIcon(forum.icon, size: 22),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(forum.name,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                    overflow: TextOverflow.ellipsis),
-              ),
-            ],
-          ),
-        ));
-      }
-    }
-
-    final media = MediaQuery.of(context);
-    final top = media.padding.top + kToolbarHeight;
-    final selected = await showMenu<ForumInfo>(
-      context: context,
-      color: context.scheme.surface,
-      position: RelativeRect.fromLTRB(media.size.width, top, 8, 0),
-      constraints: BoxConstraints(maxHeight: media.size.height * 0.7, minWidth: 240),
-      items: items,
-    );
-    if (selected != null && context.mounted) {
-      context.openForum(selected.slug, name: selected.name);
-    }
   }
 }
 

@@ -7,6 +7,8 @@ import 'screens/conversation_screen.dart';
 import 'screens/forum_threads_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/new_thread_screen.dart';
+import 'screens/profile_screen.dart';
+import 'screens/search_screen.dart';
 import 'screens/setup_screen.dart';
 import 'screens/thread_screen.dart';
 import 'screens/user_screen.dart';
@@ -68,9 +70,26 @@ GoRouter buildRouter(WidgetRef ref) {
         builder: (c, s) => UserScreen(username: s.pathParameters['username']!),
       ),
       GoRoute(path: '/watches', builder: (c, s) => const WatchesScreen()),
+      GoRoute(path: '/profile', builder: (c, s) => const ProfileScreen()),
+      GoRoute(path: '/search', builder: (c, s) => const SearchScreen()),
     ],
   );
 }
+
+/// App-bar actions shared across the home tabs: search (magnifier) on the left,
+/// profile on the right.
+List<Widget> profileBarActions(BuildContext context) => [
+      IconButton(
+        icon: const Icon(Icons.search),
+        tooltip: 'Buscar',
+        onPressed: () => context.openSearch(),
+      ),
+      IconButton(
+        icon: const Icon(Icons.account_circle_outlined),
+        tooltip: 'Perfil',
+        onPressed: () => context.openProfile(),
+      ),
+    ];
 
 /// Bridges the Riverpod config provider to go_router's refresh mechanism.
 class _ConfigListenable extends ChangeNotifier {
@@ -98,6 +117,8 @@ extension MvNav on BuildContext {
       push('/conversation/$id', extra: {'title': title});
   void openUser(String username) => push('/user/$username');
   void openWatches() => push('/watches');
+  void openProfile() => push('/profile');
+  void openSearch() => push('/search');
 
   /// Opens a thread from a Mediavida URL, handling the two shapes MV uses:
   ///  - legacy/notification form: `.../foro/tema.php?tid=X&pagina=Y#POSTNUM`

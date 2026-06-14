@@ -5,6 +5,7 @@ import '../state/providers.dart';
 import '../router.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
+import '../widgets/subforos_title.dart';
 
 final _inboxProvider = FutureProvider.autoDispose<List<InboxItem>>((ref) async {
   final api = ref.watch(apiProvider);
@@ -20,14 +21,8 @@ class InboxScreen extends ConsumerWidget {
     final inbox = ref.watch(_inboxProvider);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Mensajes'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Actualizar',
-            onPressed: () => ref.invalidate(_inboxProvider),
-          ),
-        ],
+        title: const SubforosTitle(),
+        actions: profileBarActions(context),
       ),
       body: inbox.when(
         loading: () => const LoadingView(),

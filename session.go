@@ -187,8 +187,9 @@ func (ss *SessionStore) AutoLogin(clientID, user, pass string) error {
 	if secret := os.Getenv("MV_TOTP_SECRET"); secret != "" {
 		scraper.SetTOTPSecret(secret)
 	}
-	// Relogin clears any stale cookies, logs in fresh and auto-submits the
-	// TOTP guard code when required, then persists the session to disk.
+	// Fresh scraper (empty jar), so Relogin performs a clean login and
+	// auto-submits the TOTP guard code when a secret is configured, then
+	// persists the session.
 	if err := scraper.Relogin(); err != nil {
 		return err
 	}

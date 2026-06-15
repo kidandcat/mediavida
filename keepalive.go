@@ -68,21 +68,26 @@ func (ka *SessionKeepAlive) refreshAll() {
 		}
 		username := s.Scraper.Username()
 
-		// Visit the homepage to get fresh Set-Cookie headers
+		// Touch the homepage so MV refreshes any sliding-expiry cookies.
 		if err := s.Scraper.RefreshSession(); err != nil {
-			log.Printf("[keepalive] refresh failed for %s: %v", username, err)
+			log.Printf("[keepalive] homepage touch failed for %s: %v", username, err)
+		}
 
-			// Fallback: try validating the session to at least touch the server
-			if s.Scraper.ValidateSession() {
-				log.Printf("[keepalive] session still valid for %s (validate succeeded)", username)
-				s.Scraper.SaveSession()
-			} else {
-				log.Printf("[keepalive] session appears expired for %s", username)
-			}
+		// The homepage is public, so a 200 there does NOT prove the session is
+		// still authenticated. Verify against an authenticated endpoint; if the
+		// session has expired, re-login silently now (stored credentials +
+		// remember cookie) — well before the user opens the app — so MV's short
+		// session-cookie lifetime never surfaces as a logout in the app.
+		if s.Scraper.ValidateSession() {
+			s.Scraper.SaveSession()
 			return
 		}
 
-		s.Scraper.SaveSession()
-		log.Printf("[keepalive] session refreshed and saved for %s", username)
+		log.Printf("[keepalive] session expired for %s, re-logging in", username)
+		if err := s.Scraper.Relogin(); err != nil {
+			log.Printf("[keepalive] silent re-login failed for %s (user must re-auth): %v", username, err)
+			return
+		}
+		log.Printf("[keepalive] silently re-logged in %s", username)
 	})
 }

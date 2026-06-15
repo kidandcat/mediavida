@@ -1717,29 +1717,61 @@ func (s *ForumScraper) SetTOTPSecret(secret string) {
 	s.totpSecret = secret
 }
 
-// Relogin clears the session and performs a fresh login.
-// If guard verification is required and a TOTP secret is configured,
-// it automatically generates and submits the code.
+// Relogin renews the Mediavida session without throwing away the long-lived
+// "remember device" cookie, so MV skips the guard and the server can silently
+// re-authenticate from the stored credentials.
 func (s *ForumScraper) Relogin() error {
-	s.ClearSession()
-	if err := s.Login(); err != nil {
-		var guardErr *ErrGuardRequired
-		if errors.As(err, &guardErr) && s.totpSecret != "" {
-			code, terr := generateTOTP(s.totpSecret)
-			if terr != nil {
-				return fmt.Errorf("TOTP generation failed: %w", terr)
-			}
-			log.Printf("Guard required, submitting TOTP code automatically")
-			if gerr := s.SubmitGuard(guardErr.GuardURL, code); gerr != nil {
-				return fmt.Errorf("auto guard verification failed: %w", gerr)
-			}
-			s.SaveSession()
-			return nil
-		}
-		return err
+	// Renew the session WITHOUT discarding the long-lived "remember device"
+	// cookie. MV issues that cookie after the first guard (remember_device=1);
+	// presenting it on a fresh login makes MV skip the guard, so we can silently
+	// re-authenticate from the stored credentials for as long as it lives
+	// (~weeks). The user only re-enters a TOTP code when the remember cookie
+	// itself expires.
+	//
+	// Crucially this does NOT call ClearSession. Deleting the durable Colmena
+	// record (and wiping the remember cookie) on what is usually a transient
+	// upstream failure (anti-bot challenge, rate-limit, network blip) was what
+	// kicked users back to the login screen: it threw away the very cookie that
+	// lets MV skip the guard, so the re-login then demanded a TOTP code the
+	// server cannot supply. We keep the cookie jar intact and overwrite the
+	// durable session only on a successful re-login; on failure it is left
+	// untouched so a later retry — on this or any node — can still recover.
+	s.setLoggedIn(false)
+
+	err := s.Login()
+	if err == nil {
+		s.SaveSession()
+		return nil
 	}
-	s.SaveSession()
-	return nil
+
+	// Single-account deploys may carry a TOTP secret; satisfy the guard
+	// automatically when present. In the multi-user app this is empty and only
+	// the user can provide the code, so the guard error is surfaced instead.
+	var guardErr *ErrGuardRequired
+	if errors.As(err, &guardErr) && s.totpSecret != "" {
+		code, terr := generateTOTP(s.totpSecret)
+		if terr != nil {
+			return fmt.Errorf("TOTP generation failed: %w", terr)
+		}
+		log.Printf("Guard required, submitting TOTP code automatically")
+		if gerr := s.SubmitGuard(guardErr.GuardURL, code); gerr != nil {
+			return fmt.Errorf("auto guard verification failed: %w", gerr)
+		}
+		s.SaveSession()
+		return nil
+	}
+
+	// GET /login redirected away from the form (no CSRF token in the page) →
+	// the session is actually still valid (a false-positive expiry from a
+	// transient challenge). Confirm via the authenticated endpoint and treat it
+	// as success rather than forcing a logout.
+	if strings.Contains(err.Error(), "no CSRF token") && s.ValidateSession() {
+		s.setLoggedIn(true)
+		s.SaveSession()
+		return nil
+	}
+
+	return err
 }
 
 // IsLoggedIn returns whether the scraper believes it has an active session.

@@ -3,9 +3,38 @@ import { px } from '@zos/utils'
 import { openSync, readSync, closeSync, O_RDONLY } from '@zos/fs'
 import { set, cancel } from '@zos/alarm'
 import { launchApp } from '@zos/router'
+import { Battery } from '@zos/sensor'
 
 const SCREEN_W = px(480)
 const CENTER = px(240)
+
+// Battery indicator geometry (horizontal battery glyph). Sits in the right gap,
+// between the center and the 3 o'clock marker, vertically centered — drawn under
+// the hands so they sweep over it like a classic complication. Pure FILL_RECT
+// widgets (no image assets); the fill bar shrinks as the charge drops and recolors
+// to Mediavida's danger red when low. Visible in both normal and always-on (AOD).
+const BAT_BODY_W = px(54)
+const BAT_BODY_H = px(24)
+const BAT_BODY_X = px(300)
+const BAT_BODY_Y = CENTER - px(12)
+const BAT_BORDER = px(2)
+const BAT_INNER_X = BAT_BODY_X + BAT_BORDER
+const BAT_INNER_Y = BAT_BODY_Y + BAT_BORDER
+const BAT_INNER_W = BAT_BODY_W - BAT_BORDER * 2
+const BAT_INNER_H = BAT_BODY_H - BAT_BORDER * 2
+const BAT_FILL_PAD = px(1)
+const BAT_FILL_X = BAT_INNER_X + BAT_FILL_PAD
+const BAT_FILL_Y = BAT_INNER_Y + BAT_FILL_PAD
+const BAT_FILL_MAX_W = BAT_INNER_W - BAT_FILL_PAD * 2
+const BAT_FILL_H = BAT_INNER_H - BAT_FILL_PAD * 2
+
+// Mediavida palette (from mobile/lib/theme.dart): brand orange for the normal
+// fill, danger red when low, muted gray for the outline.
+const BAT_COLOR_BORDER = 0x8f989e // MV textSecondary gray
+const BAT_COLOR_BG = 0x000000
+const BAT_COLOR_HIGH = 0xcb8538 // same orange as the MV logo ring
+const BAT_COLOR_LOW = 0xe03d3d // MV danger red
+const BAT_LOW_THRESHOLD = 20
 
 // How often to re-read the shared file (30 seconds)
 const READ_INTERVAL = 30 * 1000
@@ -21,6 +50,8 @@ WatchFace({
     widgets: {},
     readTimer: null,
     alarmId: null,
+    battery: null,
+    batteryCb: null,
   },
 
   build() {
@@ -32,11 +63,53 @@ WatchFace({
       show_level: show_level.ONLY_NORMAL | show_level.ONAL_AOD,
     })
 
+    // Battery glyph (right gap, between center and 3 o'clock). Created before the
+    // hands so they sweep over it. Border → carved black inner → colored fill bar
+    // that shrinks/recolors with the charge, plus a terminal nub. Shown in both
+    // normal and AOD so it stays visible while asleep.
+    const BAT_SHOW = show_level.ONLY_NORMAL | show_level.ONAL_AOD
+    createWidget(widget.FILL_RECT, {
+      x: BAT_BODY_X,
+      y: BAT_BODY_Y,
+      w: BAT_BODY_W,
+      h: BAT_BODY_H,
+      radius: px(5),
+      color: BAT_COLOR_BORDER,
+      show_level: BAT_SHOW,
+    })
+    createWidget(widget.FILL_RECT, {
+      x: BAT_INNER_X,
+      y: BAT_INNER_Y,
+      w: BAT_INNER_W,
+      h: BAT_INNER_H,
+      radius: px(3),
+      color: BAT_COLOR_BG,
+      show_level: BAT_SHOW,
+    })
+    createWidget(widget.FILL_RECT, {
+      x: BAT_BODY_X + BAT_BODY_W,
+      y: BAT_BODY_Y + (BAT_BODY_H - px(10)) / 2,
+      w: px(4),
+      h: px(10),
+      radius: px(2),
+      color: BAT_COLOR_BORDER,
+      show_level: BAT_SHOW,
+    })
+    this.state.widgets.batteryFill = createWidget(widget.FILL_RECT, {
+      x: BAT_FILL_X,
+      y: BAT_FILL_Y,
+      w: BAT_FILL_MAX_W,
+      h: BAT_FILL_H,
+      radius: px(2),
+      color: BAT_COLOR_HIGH,
+      show_level: BAT_SHOW,
+    })
+
     // MV logo at center-top area. Doubles as the pairing indicator: colored when
     // paired & data is fresh, desaturated (gray) when pairing is needed.
     this.state.widgets.logo = createWidget(widget.IMG, {
-      x: CENTER - px(28),
-      y: px(140),
+      x: CENTER - px(56),
+      y: px(96),
       src: 'mv_logo.png',
       show_level: show_level.ONLY_NORMAL | show_level.ONAL_AOD,
     })
@@ -147,10 +220,17 @@ WatchFace({
       show_level: BOTH,
     })
 
+    // Battery sensor: render now, then update whenever the level changes.
+    this.state.battery = new Battery()
+    this.state.batteryCb = () => this.updateBattery()
+    this.state.battery.onChange(this.state.batteryCb)
+    this.updateBattery()
+
     // Resume/pause lifecycle
     createWidget(widget.WIDGET_DELEGATE, {
       resume_call: () => {
         this.readData()
+        this.updateBattery()
       },
       pause_call: () => {},
     })
@@ -161,15 +241,18 @@ WatchFace({
     // Set recurring alarm to launch companion app for data refresh
     this.scheduleRefresh()
 
-    // Periodically re-read the shared file
-    this.state.readTimer = setInterval(() => this.readData(), READ_INTERVAL)
+    // Periodically re-read the shared file + refresh the battery glyph
+    this.state.readTimer = setInterval(() => {
+      this.readData()
+      this.updateBattery()
+    }, READ_INTERVAL)
 
     // Invisible clickable area over logo - tap to refresh
     createWidget(widget.BUTTON, {
-      x: CENTER - px(28),
-      y: px(140),
-      w: px(56),
-      h: px(56),
+      x: CENTER - px(56),
+      y: px(96),
+      w: px(112),
+      h: px(112),
       text: '',
       normal_src: 'transparent.png',
       press_src: 'transparent.png',
@@ -252,6 +335,26 @@ WatchFace({
     widgets.bfIcon && widgets.bfIcon.setProperty(prop.MORE, { src: bfN > 0 ? 'icon_fav_active.png' : 'icon_fav_gray.png' })
   },
 
+  // Reads the current charge and updates the fill bar: width proportional to the
+  // level, color stepping green → orange → red as it empties.
+  updateBattery() {
+    const fill = this.state.widgets.batteryFill
+    if (!fill || !this.state.battery) return
+
+    let level = this.state.battery.getCurrent()
+    if (typeof level !== 'number' || isNaN(level)) level = 0
+    level = Math.max(0, Math.min(100, level))
+
+    let w = Math.round((BAT_FILL_MAX_W * level) / 100)
+    // Keep a sliver visible at very low (non-zero) levels so the glyph reads as
+    // "almost empty" rather than blank.
+    if (level > 0 && w < px(3)) w = px(3)
+
+    const color = level <= BAT_LOW_THRESHOLD ? BAT_COLOR_LOW : BAT_COLOR_HIGH
+
+    fill.setProperty(prop.MORE, { x: BAT_FILL_X, y: BAT_FILL_Y, w, h: BAT_FILL_H, color })
+  },
+
   scheduleRefresh() {
     try {
       // Cancel previous alarm if any
@@ -280,6 +383,9 @@ WatchFace({
     }
     if (this.state.alarmId !== null) {
       try { cancel(this.state.alarmId) } catch (e) { /* ignore */ }
+    }
+    if (this.state.battery && this.state.batteryCb) {
+      try { this.state.battery.offChange(this.state.batteryCb) } catch (e) { /* ignore */ }
     }
   },
 })

@@ -155,18 +155,34 @@ func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, wat
 		clientID := token
 		// Valid if it's a configured API token (legacy/tooling) or it has a live
 		// session created via /auth/app-login (per-device app login).
-		if !validTokens[token] && (sessions == nil || sessions.Get(token) == nil) {
-			// Otherwise it may be a watch token — resolve it to its owner so it
-			// reuses the owner's single MV session.
-			owner, ok := "", false
-			if watchTokens != nil {
-				owner, ok = watchTokens.Owner(token)
-			}
-			if !ok || sessions == nil || sessions.Get(owner) == nil {
-				http.Error(w, "unauthorized: invalid API token", http.StatusUnauthorized)
+		if !validTokens[token] {
+			// A transient session-store failure must NOT be reported as an
+			// invalid token (which logs the app out). This middleware gates EVERY
+			// request, so a momentary Colmena blip here would otherwise sign every
+			// device out at once. Map it to a retryable 503 instead.
+			sess, err := lookupSession(sessions, token)
+			if errors.Is(err, errSessionStoreUnavailable) {
+				http.Error(w, "session store temporarily unavailable; retry", http.StatusServiceUnavailable)
 				return
 			}
-			clientID = owner
+			if sess == nil {
+				// Otherwise it may be a watch token — resolve it to its owner so it
+				// reuses the owner's single MV session.
+				owner, ok := "", false
+				if watchTokens != nil {
+					owner, ok = watchTokens.Owner(token)
+				}
+				ownerSess, oerr := lookupSession(sessions, owner)
+				if errors.Is(oerr, errSessionStoreUnavailable) {
+					http.Error(w, "session store temporarily unavailable; retry", http.StatusServiceUnavailable)
+					return
+				}
+				if !ok || ownerSess == nil {
+					http.Error(w, "unauthorized: invalid API token", http.StatusUnauthorized)
+					return
+				}
+				clientID = owner
+			}
 		}
 
 		ctx := context.WithValue(r.Context(), clientIDKey, clientID)

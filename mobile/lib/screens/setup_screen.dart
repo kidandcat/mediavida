@@ -20,7 +20,39 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
   final _code = TextEditingController();
   bool _busy = false;
   bool _guard = false;
+  bool _checking = true; // probing an existing server session before showing the form
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _recoverSession();
+  }
+
+  /// Self-heal: this device keeps a stable [deviceToken], and the backend ties
+  /// the Mediavida session to it. A transient backend hiccup (e.g. a Colmena
+  /// store blip returning 503/401 from a node that didn't have the session hot)
+  /// can flip the local `loggedIn` flag off and bounce us here — even though the
+  /// server session is perfectly alive. Before asking for credentials, probe
+  /// `/auth/status`; if it's still authenticated, restore the session silently
+  /// instead of forcing a needless re-login.
+  Future<void> _recoverSession() async {
+    final api = ref.read(apiProvider);
+    if (api == null) {
+      if (mounted) setState(() => _checking = false);
+      return;
+    }
+    try {
+      if (await api.isAuthenticated()) {
+        await ref.read(configProvider.notifier).markLoggedIn();
+        return; // router redirect handles navigation to '/'
+      }
+    } catch (_) {
+      // Network/transient error: fall through to the login form (a real login
+      // attempt will surface any persistent problem).
+    }
+    if (mounted) setState(() => _checking = false);
+  }
 
   @override
   void dispose() {
@@ -76,6 +108,9 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_checking) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
     return Scaffold(
       body: SafeArea(
         child: Center(

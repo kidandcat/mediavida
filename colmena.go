@@ -230,10 +230,38 @@ func (cs *ColmenaStore) PutSession(r SessionRecord) error {
 	return err
 }
 
+// localRead carries ConsistencyNone so a query reads this node's local SQLite
+// replica directly, with NO communication to the leader. Session reads use it
+// because the default (ConsistencyWeak) forwards reads to the leader, so a
+// leader election or quorum blip makes the read fail — which the auth gate then
+// (used to) surface as a 401 and bounce a perfectly-valid logged-in device to
+// the login screen. A local read can't fail that way; stale session cookies are
+// harmless here (they change only on login/guard/re-login and are long-lived).
+func localRead() context.Context {
+	return colmena.WithConsistency(context.Background(), colmena.ConsistencyNone)
+}
+
 // GetSession reads one device's durable session (ok=false if absent).
+//
+// It reads the LOCAL replica first (blip-proof: no leader contact). On a local
+// miss it falls back to a leader-routed read to catch a session just created on
+// another node and not yet replicated here — and if there's no reachable leader
+// at that moment, that read errors and the caller maps it to a retryable 503,
+// never a false "logged out". The common case (an established session, already
+// replicated locally) is served entirely from the local replica and so survives
+// leader elections untouched.
 func (cs *ColmenaStore) GetSession(clientID string) (SessionRecord, bool, error) {
+	if r, ok, err := cs.scanSession(localRead(), clientID); err != nil || ok {
+		return r, ok, err
+	}
+	// Local miss: double-check the leader (default consistency) for a freshly
+	// written session that hasn't replicated to this node yet.
+	return cs.scanSession(context.Background(), clientID)
+}
+
+func (cs *ColmenaStore) scanSession(ctx context.Context, clientID string) (SessionRecord, bool, error) {
 	var r SessionRecord
-	err := cs.db.QueryRow(
+	err := cs.db.QueryRowContext(ctx,
 		`SELECT client_id, mv_user, mv_pass, cookies FROM mv_sessions WHERE client_id = ?`, clientID,
 	).Scan(&r.ClientID, &r.User, &r.Pass, &r.Cookies)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -243,9 +271,11 @@ func (cs *ColmenaStore) GetSession(clientID string) (SessionRecord, bool, error)
 }
 
 // AllSessions returns every durable session (used to rehydrate hot scrapers at
-// boot, replacing RestoreAllFromDisk).
+// boot, replacing RestoreAllFromDisk). Reads the local replica — a node
+// rehydrates whatever it has locally and restores any not-yet-replicated
+// session on demand via GetSession later.
 func (cs *ColmenaStore) AllSessions() ([]SessionRecord, error) {
-	rows, err := cs.db.Query(`SELECT client_id, mv_user, mv_pass, cookies FROM mv_sessions`)
+	rows, err := cs.db.QueryContext(localRead(), `SELECT client_id, mv_user, mv_pass, cookies FROM mv_sessions`)
 	if err != nil {
 		return nil, err
 	}

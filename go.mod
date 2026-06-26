@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/PuerkitoBio/goquery v1.8.1
-	github.com/mentasystems/colmena v0.0.0-00010101000000-000000000000
+	github.com/mentasystems/colmena v0.12.0
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.51.0
 	golang.org/x/oauth2 v0.36.0
@@ -41,5 +41,3 @@ require (
 	modernc.org/memory v1.8.2 // indirect
 	modernc.org/sqlite v1.36.3 // indirect
 )
-
-replace github.com/mentasystems/colmena => /Users/jairo/colmena

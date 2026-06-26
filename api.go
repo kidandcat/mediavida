@@ -62,7 +62,12 @@ func decodeJSON(r *http.Request, v any) error { // any-ok: decodes into caller-p
 // nil and writing a 401 if no MV session is active.
 func requireAuthenticated(w http.ResponseWriter, r *http.Request, sessions *SessionStore) (*ForumScraper, string) {
 	clientID := ClientIDFromContext(r.Context())
-	s := sessions.Get(clientID)
+	s, err := sessions.Lookup(clientID)
+	if errors.Is(err, errSessionStoreUnavailable) {
+		// Transient store failure — tell the client to retry, NOT to log out.
+		writeError(w, http.StatusServiceUnavailable, "session store temporarily unavailable; retry")
+		return nil, clientID
+	}
 	if s == nil || s.Status != "authenticated" || s.Scraper == nil {
 		writeError(w, http.StatusUnauthorized, "no active mediavida session — call POST /auth/login")
 		return nil, clientID
@@ -76,9 +81,23 @@ func requireAuthenticated(w http.ResponseWriter, r *http.Request, sessions *Sess
 // writeAPIError so the client can drop to the login screen.
 var errReauthRequired = errors.New("session expired, re-authentication required") // global-ok: sentinel error value
 
+// errReloginTransient marks a re-login that failed for what is almost certainly
+// a TRANSIENT reason (anti-bot/Cloudflare challenge, rate-limit, upstream 5xx,
+// network blip, a "no CSRF token" challenge page) rather than a genuine need for
+// the user to re-authenticate. Mapped to HTTP 503 (retryable) by writeAPIError —
+// NEVER 401 — so a momentary Mediavida hiccup doesn't kick a perfectly-valid
+// logged-in device to the login screen. The client retries and the session
+// self-heals on a later attempt (on this or any node). This was a remaining
+// cause of spurious overnight logouts: any single failed re-login attempt used
+// to surface as a 401 even though the underlying session was still recoverable.
+var errReloginTransient = errors.New("session temporarily unavailable; retry") // global-ok: sentinel error value
+
 // withRelogin runs fn; if it returns ErrSessionExpired it relogs in once and
-// retries. If the re-login itself fails the session can no longer be renewed
-// without the user, so it returns an error wrapping errReauthRequired (→ 401).
+// retries. If the re-login itself fails, the failure is classified: only a
+// genuine "user must act" failure (MV now demands a guard code we cannot supply
+// because the long-lived remember-device cookie expired) maps to 401 via
+// errReauthRequired. Every other re-login failure is treated as transient
+// (errReloginTransient → 503) so the device stays logged in and retries.
 func withRelogin(scraper *ForumScraper, fn func() error) error {
 	err := fn()
 	if err == nil {
@@ -90,17 +109,32 @@ func withRelogin(scraper *ForumScraper, fn func() error) error {
 	}
 	log.Printf("[api] session invalid for %s, attempting re-login", scraper.Username())
 	if rerr := scraper.Relogin(); rerr != nil {
-		return fmt.Errorf("%w: %w", errReauthRequired, rerr)
+		// Distinguish "the user genuinely has to re-authenticate" (guard now
+		// required and no TOTP secret to satisfy it) from a transient upstream
+		// failure. Only the former logs the app out; the latter is retryable so a
+		// nightly anti-bot challenge / blip never forces a logout.
+		var guardErr *ErrGuardRequired
+		if errors.As(rerr, &guardErr) {
+			log.Printf("[api] re-login for %s needs the user (guard required): %v", scraper.Username(), rerr)
+			return fmt.Errorf("%w: %w", errReauthRequired, rerr)
+		}
+		log.Printf("[api] re-login for %s failed transiently, will retry (no logout): %v", scraper.Username(), rerr)
+		return fmt.Errorf("%w: %w", errReloginTransient, rerr)
 	}
 	return fn()
 }
 
 // writeAPIError maps a data-endpoint error to an HTTP status: 401 when the
 // Mediavida session is gone and must be re-established by the user (so the app
-// shows the login screen), 502 otherwise (upstream scrape/parse failure).
+// shows the login screen), 503 when re-login failed transiently (retryable, no
+// logout), 502 otherwise (upstream scrape/parse failure).
 func writeAPIError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errReauthRequired) {
 		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if errors.Is(err, errReloginTransient) {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	writeError(w, http.StatusBadGateway, err.Error())
@@ -185,7 +219,14 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 
 	mux.HandleFunc("GET /auth/status", func(w http.ResponseWriter, r *http.Request) {
 		clientID := ClientIDFromContext(r.Context())
-		s := sessions.Get(clientID)
+		s, err := sessions.Lookup(clientID)
+		if errors.Is(err, errSessionStoreUnavailable) {
+			// Transient store failure: do NOT report "unauthenticated" — that
+			// would make the app's verifySession() drop a valid login. 503 so
+			// the client treats it as "unknown" and keeps the session.
+			writeError(w, http.StatusServiceUnavailable, "session store temporarily unavailable; retry")
+			return
+		}
 		if s == nil || s.Status != "authenticated" || s.Scraper == nil {
 			writeJSON(w, http.StatusOK, statusResponse{Status: "unauthenticated"})
 			return
@@ -895,7 +936,13 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		clientID := ClientIDFromContext(r.Context())
-		s := sessions.Get(clientID)
+		s, err := sessions.Lookup(clientID)
+		if errors.Is(err, errSessionStoreUnavailable) {
+			// Transient store failure — retryable, not a logout (the app's SSE
+			// loop reconnects on 503 but signs out on 401).
+			writeError(w, http.StatusServiceUnavailable, "session store temporarily unavailable; retry")
+			return
+		}
 		if s == nil || s.Status != "authenticated" {
 			writeError(w, http.StatusUnauthorized, "no active mediavida session")
 			return

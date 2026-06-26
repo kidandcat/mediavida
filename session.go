@@ -32,24 +32,55 @@ func NewSessionStore(cs *ColmenaStore) *SessionStore {
 	}
 }
 
-// Get returns a session by client ID.
+// errSessionStoreUnavailable marks a TRANSIENT failure to read the durable
+// session store (Colmena leader election, quorum loss, network blip), as opposed
+// to the session genuinely not existing. Auth gates must map this to a retryable
+// 503 — never a 401 — so a momentary store hiccup doesn't kick the user to the
+// login screen even though their session is perfectly valid.
+var errSessionStoreUnavailable = errors.New("session store temporarily unavailable") // global-ok: sentinel error value
+
+// Get returns a session by client ID, or nil when none is active. It does NOT
+// distinguish "no session" from a transient store failure — callers gating
+// authentication should use [Lookup] instead so they can return 503 (retry)
+// rather than 401 (logout) on a transient Colmena read error.
 func (ss *SessionStore) Get(clientID string) *Session {
+	s, _ := ss.Lookup(clientID) // safe-ignore: Get intentionally collapses "no session" and "store unavailable" to nil; callers needing the distinction use Lookup
+	return s
+}
+
+// lookupSession is a nil-safe wrapper around [SessionStore.Lookup]: a nil store
+// (some test/tooling wiring passes none) resolves to "no session" without a
+// transient error, matching the historical `sessions == nil` short-circuit.
+func lookupSession(ss *SessionStore, clientID string) (*Session, error) {
+	if ss == nil {
+		return nil, nil
+	}
+	return ss.Lookup(clientID)
+}
+
+// Lookup is like [Get] but surfaces whether a nil result is definitive (no
+// session: nil, nil) or transient (store unavailable: nil, errSessionStoreUnavailable).
+func (ss *SessionStore) Lookup(clientID string) (*Session, error) {
 	ss.mu.RLock()
 	s := ss.sessions[clientID]
 	ss.mu.RUnlock()
 	if s != nil {
-		return s
+		return s, nil
 	}
 	// Multi-node cluster: the session may have been created on another node and
 	// only live in Raft (this node's in-memory map is per-process). Lazily
 	// rehydrate from Colmena so any node can serve any device — without this, a
 	// login on node A followed by a request routed to node B looks unauthenticated.
-	if ss.RestoreSession(clientID) {
+	ok, err := ss.restoreSessionE(clientID)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
 		ss.mu.RLock()
 		s = ss.sessions[clientID]
 		ss.mu.RUnlock()
 	}
-	return s
+	return s, nil
 }
 
 // Set stores a session for a client ID.
@@ -63,18 +94,27 @@ func (ss *SessionStore) Set(clientID string, s *Session) {
 // client ID. Validates the session is still active; if expired, attempts
 // re-login. Returns true if a session was successfully restored.
 func (ss *SessionStore) RestoreSession(clientID string) bool {
+	ok, _ := ss.restoreSessionE(clientID) // safe-ignore: bool-only callers don't distinguish a transient store error from a missing session; Lookup surfaces it
+	return ok
+}
+
+// restoreSessionE is [RestoreSession] that also reports a TRANSIENT store-read
+// failure (errSessionStoreUnavailable) distinctly from "no session on record"
+// ((false, nil)). A failed read of Colmena must NOT be mistaken for a logged-out
+// device — that was the cause of spurious logouts on every Colmena blip.
+func (ss *SessionStore) restoreSessionE(clientID string) (bool, error) {
 	if ss.cs == nil {
-		return false
+		return false, nil
 	}
 	rec, ok, err := ss.cs.GetSession(clientID)
 	if err != nil {
 		log.Printf("Failed to read session for client %s: %v", clientID, err)
-		return false
+		return false, errSessionStoreUnavailable
 	}
 	if !ok {
-		return false
+		return false, nil
 	}
-	return ss.restoreFromRecord(rec)
+	return ss.restoreFromRecord(rec), nil
 }
 
 // restoreFromRecord rehydrates a hot *ForumScraper from a durable SessionRecord,

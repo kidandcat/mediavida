@@ -42,6 +42,19 @@ const COMPANION_APP_ID = 1024002
 const DATA_FILE = 'data.json'
 const REFRESH_MINUTES = 5
 
+// Self-heal a dead refresh chain. The companion's 5-min alarm chain re-arms
+// itself on every run, but if a single run never happens (watch reboot, Zepp OS
+// dropping the alarm, BLE down during the window) the chain dies for good and
+// the counters freeze — until the mini-app is opened by hand (the old
+// un-pair/re-pair dance). To recover automatically, whenever the watchface
+// becomes visible we check how old data.json is; if it's stale past
+// STALE_MS (well beyond two normal cycles) we relaunch the companion page —
+// exactly what a tap on the logo does — which refetches AND re-arms the chain.
+// A cooldown stops this from firing on every wrist-raise while genuinely
+// offline (e.g. BLE out of range).
+const STALE_MS = (REFRESH_MINUTES * 2 + 1) * 60 * 1000 // ~11 min
+const AUTO_REFRESH_COOLDOWN_MS = 60 * 1000
+
 WatchFace({
   state: {
     bm: '--',
@@ -52,6 +65,7 @@ WatchFace({
     alarmId: null,
     battery: null,
     batteryCb: null,
+    lastAutoRefresh: 0,
   },
 
   build() {
@@ -231,6 +245,8 @@ WatchFace({
       resume_call: () => {
         this.readData()
         this.updateBattery()
+        // Looking at the watch is the moment to recover a frozen chain.
+        this.maybeAutoRefresh()
       },
       pause_call: () => {},
     })
@@ -303,11 +319,31 @@ WatchFace({
         // `st` is written by the companion on every cycle; older files without
         // it but with counters mean a successful fetch → treat as 'ok'.
         this.renderStatus(data.st || 'ok', data.ts || 0)
+        this.state.lastTs = Number(data.ts) || 0
       }
     } catch (e) {
       this.renderStatus('error', 0)
     }
 
+  },
+
+  // maybeAutoRefresh relaunches the companion page (same as a tap on the logo)
+  // when the cached counters are stale past STALE_MS — reviving a refresh chain
+  // that died (watch reboot / Zepp OS dropped the alarm / BLE was down). Guarded
+  // by a cooldown so it fires at most once a minute even if we stay offline.
+  maybeAutoRefresh() {
+    const ts = this.state.lastTs
+    if (!ts) return // never fetched yet — pairing flow handles first contact
+    let now = 0
+    try { now = Date.now() } catch (e) { return }
+    if (now - ts <= STALE_MS) return // data is fresh enough; chain is alive
+    if (now - this.state.lastAutoRefresh < AUTO_REFRESH_COOLDOWN_MS) return
+    this.state.lastAutoRefresh = now
+    try {
+      launchApp({ appId: COMPANION_APP_ID, url: 'page/index', param: 'auto=1' })
+    } catch (e) {
+      /* launch failed; will retry on the next resume */
+    }
   },
 
   // renderStatus uses the MV logo itself as the pairing indicator: colored when

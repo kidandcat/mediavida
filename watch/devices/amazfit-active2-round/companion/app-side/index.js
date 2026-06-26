@@ -33,13 +33,26 @@ const messageBuilder = new MessageBuilder()
 // `oldToken` (if any) is handed to the phone so the backend revokes it.
 function pairAndFetch(oldToken) {
   return pair(oldToken).then((creds) => {
-    return fetchBubbles(creds.token, creds.baseUrl).then((data) => {
-      if (data && data.unauthorized) {
-        // Brand-new token already rejected — surface as needing re-pair.
-        return { needPair: true }
-      }
-      return { result: data, paired: creds }
-    })
+    // The token is already minted (and `oldToken` revoked) on the backend by
+    // the time this resolves. So we MUST hand `creds` back for the page to
+    // persist regardless of what the first fetch below does — if we only
+    // returned `paired` on a successful fetch, a transient post-pair fetch
+    // failure (BLE blip) would make the watch DISCARD a valid token and re-pair
+    // next cycle, minting yet another token while the undelivered one lingers
+    // as a zombie in the paired-watches list (the "pairs as a new watch / now
+    // two appear" bug).
+    return fetchBubbles(creds.token, creds.baseUrl)
+      .then((data) => {
+        if (data && data.unauthorized) {
+          // Brand-new token already rejected — surface as needing re-pair.
+          return { needPair: true }
+        }
+        return { result: data, paired: creds }
+      })
+      .catch((err) => {
+        console.log('post-pair fetch failed (keeping minted token): ' + err)
+        return { paired: creds }
+      })
   })
 }
 

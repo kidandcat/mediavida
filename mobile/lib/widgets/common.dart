@@ -5,6 +5,31 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../theme.dart';
 
+/// Max decoded width (in pixels) for images embedded in post HTML. Forum posts
+/// routinely carry full-resolution photos/screenshots (4000px+); decoding those
+/// at native size into ARGB bitmaps (width×height×4 bytes) is the dominant OOM
+/// source — a handful per thread page blows the Android per-app heap and the OS
+/// kills the app. Phone columns never need more than ~1080px, so downsample at
+/// decode time. Aspect ratio is preserved (height left null) and smaller images
+/// aren't upscaled.
+const int _kMaxImageDecodeWidth = 1080;
+
+/// [WidgetFactory] that downsamples network images at decode time. The stock
+/// factory returns a bare `NetworkImage(url)` (full resolution), which is what
+/// made image-heavy threads OOM. Wrapping it in [ResizeImage] caps the decoded
+/// bitmap regardless of the source dimensions.
+class _DownsamplingWidgetFactory extends WidgetFactory {
+  @override
+  ImageProvider? imageProviderFromNetwork(String url) {
+    if (url.isEmpty) return null;
+    return ResizeImage(
+      NetworkImage(url),
+      width: _kMaxImageDecodeWidth,
+      allowUpscaling: false,
+    );
+  }
+}
+
 /// Renders a post's rich HTML body (`body_html`) with tappable links/images.
 class PostHtml extends StatelessWidget {
   final String html;
@@ -20,6 +45,9 @@ class PostHtml extends StatelessWidget {
     final codeBg = _hex(context.mv.surfaceHigh);
     return HtmlWidget(
       html,
+      // Downsample embedded images at decode time so a thread full of
+      // full-resolution photos can't exhaust the heap and get the app killed.
+      factoryBuilder: () => _DownsamplingWidgetFactory(),
       textStyle: TextStyle(fontSize: 15, height: 1.45, color: context.scheme.onSurface),
       // Mediavida spoiler/NSFW tags: render a collapsible box instead of the
       // dead `<a href="#">` + hidden content div.

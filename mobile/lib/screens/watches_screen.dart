@@ -44,9 +44,14 @@ class _WatchesScreenState extends ConsumerState<WatchesScreen> {
   }
 
   Future<void> _init() async {
+    // Always (re)open a pairing window the moment this screen appears — even
+    // when a watch is already paired. This binds the loopback pairing server
+    // and puts it in the "ready" state, so a watch whose token lapsed (or whose
+    // refresh chain died) can silently re-pair on its next cycle / a tap on its
+    // logo, with no manual un-pair/re-pair dance. The ambient server may already
+    // be up from the home screen; openWindow is idempotent.
+    _startPairing();
     await _loadWatches(initial: true);
-    // If nothing is paired yet, open a pairing window automatically.
-    if (_watches.isEmpty) _startPairing();
     // Tick once a second: refresh the countdown and poll the backend so a
     // completed handshake shows up.
     _ticker = Timer.periodic(const Duration(seconds: 1), (t) {

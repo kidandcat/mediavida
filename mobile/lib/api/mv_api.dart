@@ -207,9 +207,17 @@ class MvApi {
     } catch (_) {}
   }
 
+  /// Whether the backend still holds an authenticated MV session.
+  ///
+  /// Only a 200 response is conclusive. A non-2xx (e.g. a transient 503 while the
+  /// session store is briefly unavailable, surviving the retry interceptor)
+  /// THROWS rather than returning false, so the caller ([verifySession]) treats
+  /// it as "unknown" and keeps the session instead of forcing a spurious logout.
   Future<bool> isAuthenticated() async {
     final r = await _dio.get('/auth/status');
-    if (r.statusCode != 200) return false;
+    if (r.statusCode != 200) {
+      throw MvApiException('status check failed', r.statusCode);
+    }
     final d = r.data is Map ? r.data as Map : <String, dynamic>{};
     return d['status'] == 'authenticated';
   }

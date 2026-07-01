@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/PuerkitoBio/goquery v1.8.1
-	github.com/mentasystems/colmena v0.12.0
+	github.com/mentasystems/colmena v0.12.1
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.51.0
 	golang.org/x/oauth2 v0.36.0

@@ -6,6 +6,12 @@ primary_region = "cdg"
 
 [env]
   BASE_URL = "https://mediavida-api.fly.dev"
+  # Go soft memory cap: make the runtime GC hard as it approaches the limit
+  # instead of letting the heap grow until the kernel OOM-kills the process.
+  # An OOM on one voter destabilizes the whole 3-node Raft cluster (health
+  # flaps everywhere → app gets 503s → "loads forever"). Kept well under the
+  # 1GB VM to leave room for goroutine stacks, BoltDB mmap and OS/page cache.
+  GOMEMLIMIT = "768MiB"
 
 # Rolling deploy that keeps Raft quorum: replace at most one node at a time so a
 # 3-node cluster never loses more than one voter mid-deploy.
@@ -33,7 +39,10 @@ primary_region = "cdg"
 
 [[vm]]
   size = "shared-cpu-2x"
-  memory = "512mb"
+  # Bumped 512mb→1gb: the server's steady-state RSS climbs to ~300-400MB
+  # (scraper buffers + Raft in-memory log before snapshot), which repeatedly
+  # OOM-killed nodes at 512mb and flapped Raft quorum. See GOMEMLIMIT above.
+  memory = "1gb"
 
 # Durable Colmena data dir (Raft log + SQLite state) — one volume per machine.
 [[mounts]]

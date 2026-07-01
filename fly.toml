@@ -9,9 +9,9 @@ primary_region = "cdg"
   # Go soft memory cap: make the runtime GC hard as it approaches the limit
   # instead of letting the heap grow until the kernel OOM-kills the process.
   # An OOM on one voter destabilizes the whole 3-node Raft cluster (health
-  # flaps everywhere → app gets 503s → "loads forever"). Kept well under the
-  # 1GB VM to leave room for goroutine stacks, BoltDB mmap and OS/page cache.
-  GOMEMLIMIT = "768MiB"
+  # flaps everywhere → app gets 503s → "loads forever"). Kept under the VM
+  # size to leave room for goroutine stacks, BoltDB mmap and OS/page cache.
+  GOMEMLIMIT = "200MiB"
 
 # Rolling deploy that keeps Raft quorum: replace at most one node at a time so a
 # 3-node cluster never loses more than one voter mid-deploy.
@@ -39,10 +39,12 @@ primary_region = "cdg"
 
 [[vm]]
   size = "shared-cpu-2x"
-  # Bumped 512mb→1gb: the server's steady-state RSS climbs to ~300-400MB
-  # (scraper buffers + Raft in-memory log before snapshot), which repeatedly
-  # OOM-killed nodes at 512mb and flapped Raft quorum. See GOMEMLIMIT above.
-  memory = "1gb"
+  # 256mb is plenty: idle RSS is ~65MB. The earlier OOMs were NOT a real memory
+  # need — colmena's jobs queue never purged terminal jobs, so default.db grew
+  # to 117MB and every Raft snapshot materialized it (~112MB spikes) until nodes
+  # OOM-killed. Fixed at the root by colmena v0.12.1's retention reaper: snapshots
+  # dropped to ~5MB, RSS to ~65MB. (Was briefly 1gb as a band-aid before the fix.)
+  memory = "256mb"
 
 # Durable Colmena data dir (Raft log + SQLite state) — one volume per machine.
 [[mounts]]

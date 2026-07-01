@@ -109,6 +109,8 @@ github.com/mentasystems/colmena v0.12.1 h1:FMqvj+dkqIUyukSmC898CTf4w2kjbHG3BGQXG
 github.com/mentasystems/colmena v0.12.1/go.mod h1:1E7/WowoIZzfj3rLr3RFBtqtSlYifGXgg4YvsNA9Tp0=
 github.com/mentasystems/colmena v0.12.2 h1:7BWiTFetQVwns/vrJRZFXOloLlH4HvFtb3MWqDlX6M8=
 github.com/mentasystems/colmena v0.12.2/go.mod h1:1E7/WowoIZzfj3rLr3RFBtqtSlYifGXgg4YvsNA9Tp0=
+github.com/mentasystems/colmena v0.13.0 h1:mOVySapFKU5QOsd5u7gpu5sKYS6Ufa5sp1bWnbyohG4=
+github.com/mentasystems/colmena v0.13.0/go.mod h1:1E7/WowoIZzfj3rLr3RFBtqtSlYifGXgg4YvsNA9Tp0=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
 github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
 github.com/modern-go/reflect2 v0.0.0-20180701023420-4b7aa43c6742/go.mod h1:bx2lNnkwVCuqBIxFjflWJWanXIb3RllmbCylyMrvgv0=

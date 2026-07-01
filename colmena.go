@@ -59,7 +59,26 @@ func startColmenaCluster() *ColmenaStore {
 	}
 	cfg.DataDir = "/data"
 	cfg.RaftPort = 9000
-	cfg.VoterQuorum = 3
+	// Single-node topology: one voter, one machine. Collapsing the former 3-node
+	// Raft cluster removes the cross-node in-memory thread-state races AND the
+	// re-login storm (3 egress IPs logging the same MV account in tripped MV's
+	// guard — see SINGLE.md in the colmena module). One node = one egress = no
+	// storm. The tradeoff is no HA: a single volume, so a machine/volume loss is
+	// downtime (acceptable for a personal app; add litestream for mv.db backup).
+	cfg.VoterQuorum = 1
+
+	// One-shot migration from the old 3-voter cluster to a single-server config.
+	// The persisted Raft configuration lists 3 voters, so a lone surviving node
+	// would recover that config and never reach quorum (needs 2 of 3) → stuck
+	// read-only. Deleting ONLY the Raft state (raft.db + snapshots/) while keeping
+	// every <name>.db SQLite store makes HasExistingState report false, so the
+	// node cold-starts and bootstraps a fresh single-server config that adopts the
+	// existing mv.db in place — all durable rows (sessions, webhooks, mod_forums,
+	// watch_tokens) survive untouched. Set COLMENA_RESET_RAFT=1 for the migrating
+	// deploy, then remove it (subsequent boots recover the 1-server config normally).
+	if os.Getenv("COLMENA_RESET_RAFT") == "1" {
+		resetRaftStateKeepingStores(cfg.DataDir)
+	}
 
 	cluster, err := fly.Start(cfg)
 	if err != nil {
@@ -79,6 +98,24 @@ func startColmenaCluster() *ColmenaStore {
 	}
 	log.Printf("[colmena] node %s up in region %s (Raft on :%d)", cfg.NodeID, cfg.Region, cfg.RaftPort)
 	return cs
+}
+
+// resetRaftStateKeepingStores deletes the persisted Raft log + snapshots so a
+// node that used to belong to a multi-voter cluster cold-starts and bootstraps a
+// fresh single-server configuration, WITHOUT discarding the replicated SQLite
+// stores. Unlike colmena.WipeLocalState (which also removes every <name>.db so a
+// wiped node re-fetches from the leader), this keeps mv.db and its sidecars, so
+// the durable rows are adopted in place by the new single-node cluster. Must run
+// before fly.Start opens the data dir (no live Node holding the BoltDB lock).
+func resetRaftStateKeepingStores(dataDir string) {
+	for _, p := range []string{"raft.db", "snapshots"} {
+		full := dataDir + "/" + p
+		if err := os.RemoveAll(full); err != nil && !os.IsNotExist(err) {
+			log.Printf("[colmena] reset raft state: remove %s: %v", full, err)
+		} else {
+			log.Printf("[colmena] reset raft state: removed %s", full)
+		}
+	}
 }
 
 // startColmenaLocal brings up a single-node bootstrap cluster for dev.

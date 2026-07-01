@@ -8,13 +8,12 @@ primary_region = "cdg"
   BASE_URL = "https://mediavida-api.fly.dev"
   # Go soft memory cap: make the runtime GC hard as it approaches the limit
   # instead of letting the heap grow until the kernel OOM-kills the process.
-  # An OOM on one voter destabilizes the whole 3-node Raft cluster (health
-  # flaps everywhere → app gets 503s → "loads forever"). Kept under the VM
-  # size to leave room for goroutine stacks, BoltDB mmap and OS/page cache.
+  # Kept under the VM size to leave room for goroutine stacks, BoltDB mmap and
+  # OS/page cache.
   GOMEMLIMIT = "384MiB"
 
-# Rolling deploy that keeps Raft quorum: replace at most one node at a time so a
-# 3-node cluster never loses more than one voter mid-deploy.
+# Single node: a deploy replaces the one machine (brief downtime while it boots
+# and rehydrates sessions). No quorum to preserve.
 [deploy]
   strategy = "rolling"
   max_unavailable = 1
@@ -25,11 +24,11 @@ primary_region = "cdg"
   # Always-on: the server maintains the MV session and polls bubbles for push.
   auto_stop_machines = "off"
   auto_start_machines = true
-  # 3-node Raft cluster — keep all voters running for quorum.
-  min_machines_running = 3
+  # Single-node topology — one always-on machine.
+  min_machines_running = 1
 
-  # Gate rolling deploys on Colmena readiness: a replacement node only counts as
-  # healthy once it has joined Raft and caught up (colmenaStore.Healthy()).
+  # Gate the deploy on Colmena readiness: the machine only counts as healthy once
+  # its single-node Raft has a leader and is caught up (colmenaStore.Healthy()).
   [[http_service.checks]]
     method = "GET"
     path = "/health"

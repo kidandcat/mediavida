@@ -123,6 +123,18 @@ func main() {
 		}
 	}
 
+	// Enforce one MV session per account. Older app builds gave each device its
+	// OWN MV session (a second concurrent login for the same account), which
+	// fought the boot session for the single session MV allows and left the app
+	// stuck re-logging in — 503 forever. Collapse any such duplicate onto the
+	// canonical (API-token) session and re-point its device token as an alias, so
+	// existing installs recover without the user having to log in again.
+	appAliases := NewAppAliasStore(colmenaStore)
+	isAPIToken := func(id string) bool { return apiTokens[id] }
+	if n := sessions.ReconcileAccountSessions(isAPIToken, appAliases); n > 0 {
+		log.Printf("Collapsed %d duplicate account session(s) onto their canonical owner", n)
+	}
+
 	var baseURL string
 	if envURL := os.Getenv("BASE_URL"); envURL != "" {
 		baseURL = strings.TrimRight(envURL, "/")
@@ -163,7 +175,7 @@ func main() {
 	// Public auth flow (no Bearer required): browser flow + per-device app login.
 	publicMux := http.NewServeMux()
 	RegisterLoginHandler(publicMux, sessions)
-	RegisterAppLoginHandler(publicMux, sessions)
+	RegisterAppLoginHandler(publicMux, sessions, appAliases, apiTokens)
 
 	// REST API mux — everything here requires Authorization: Bearer <token>.
 	apiMux := http.NewServeMux()
@@ -174,7 +186,7 @@ func main() {
 	// it can read the clientID from the request context. Defaults: ~5 req/s
 	// sustained, burst 20.
 	limiter := NewRateLimiter(5, 20)
-	apiHandler := APITokenMiddleware(apiTokens, sessions, watchTokens, limiter.Middleware(apiMux))
+	apiHandler := APITokenMiddleware(apiTokens, sessions, watchTokens, appAliases, limiter.Middleware(apiMux))
 
 	root := http.NewServeMux()
 	// Health check for Fly's rolling deploy (keeps Raft quorum). 200 once this

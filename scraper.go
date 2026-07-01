@@ -90,6 +90,16 @@ func (s *ForumScraper) isLoggedIn() bool {
 	return s.loggedIn
 }
 
+// MatchesCredentials reports whether this scraper was authenticated with the
+// given account credentials. Used to gate aliasing a device token onto an
+// existing session: a device may only attach to a session whose credentials it
+// can reproduce, so aliasing never leaks the account to a caller that couldn't
+// have logged in itself — without a fresh (competing) login to verify. user/pass
+// are set at construction / restore and immutable thereafter.
+func (s *ForumScraper) MatchesCredentials(user, pass string) bool {
+	return s.pass != "" && s.pass == pass && strings.EqualFold(s.user, user)
+}
+
 // setLoggedIn updates the login state under the write lock.
 func (s *ForumScraper) setLoggedIn(v bool) {
 	s.mu.Lock()

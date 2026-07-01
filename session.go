@@ -282,3 +282,102 @@ func (ss *SessionStore) ForEach(fn func(clientID string, s *Session)) {
 		fn(id, s)
 	}
 }
+
+// DropSession removes a session from the in-memory map and its durable record,
+// so it is neither served nor kept alive/re-logged-in. Used to retire a
+// duplicate account session once its token has been re-pointed as an alias.
+func (ss *SessionStore) DropSession(clientID string) {
+	ss.mu.Lock()
+	delete(ss.sessions, clientID)
+	ss.mu.Unlock()
+	if ss.cs != nil {
+		if err := ss.cs.DeleteSession(clientID); err != nil {
+			log.Printf("Failed to delete duplicate session %s: %v", clientID, err)
+		}
+	}
+}
+
+// CanonicalForUser returns the clientID of the live session that should own the
+// single MV session for the given account, preferring a configured API token
+// (its session is re-established at boot) over an app-device session. Returns
+// false when no authenticated session for that account exists yet.
+func (ss *SessionStore) CanonicalForUser(user string, isAPIToken func(string) bool) (string, bool) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	canonical, found := "", false
+	for id, s := range ss.sessions {
+		if s == nil || s.Status != "authenticated" || s.Scraper == nil {
+			continue
+		}
+		if !strings.EqualFold(s.Scraper.Username(), user) {
+			continue
+		}
+		switch {
+		case !found:
+			canonical, found = id, true
+		case isAPIToken != nil && isAPIToken(id) && !isAPIToken(canonical):
+			// Prefer an API-token clientID over an app-device one.
+			canonical = id
+		case (isAPIToken == nil || isAPIToken(id) == isAPIToken(canonical)) && id < canonical:
+			// Stable tie-break so reconciliation is deterministic across nodes.
+			canonical = id
+		}
+	}
+	return canonical, found
+}
+
+// ReconcileAccountSessions enforces the "one MV session per account" invariant
+// over the DURABLE session records. Older app builds gave each device its own MV
+// session (a second concurrent login for the same account) that fought the boot
+// session for the single session MV allows and left the app stuck re-logging in.
+// For every durable session whose account also has a canonical API-token session
+// — i.e. the server's own MV_USERNAME account — it re-points that device token as
+// an app alias and retires the duplicate MV login, so existing installs recover
+// without the user logging in again. Returns the number of duplicates collapsed.
+// Safe with multiple accounts: a device logged into a DIFFERENT account than any
+// API token has no canonical to merge onto and keeps its own session untouched.
+func (ss *SessionStore) ReconcileAccountSessions(isAPIToken func(string) bool, aliases *AppAliasStore) int {
+	if ss.cs == nil {
+		return 0
+	}
+	// Canonical owner per account = the live API-token session serving it (API
+	// tokens are always (re)established at boot via AutoLogin).
+	canonicalByUser := map[string]string{}
+	ss.mu.RLock()
+	for id, s := range ss.sessions {
+		if s == nil || s.Scraper == nil || !isAPIToken(id) {
+			continue
+		}
+		u := strings.ToLower(s.Scraper.Username())
+		if u == "" {
+			continue
+		}
+		if cur, ok := canonicalByUser[u]; !ok || id < cur {
+			canonicalByUser[u] = id // stable pick if several API tokens share an account
+		}
+	}
+	ss.mu.RUnlock()
+
+	records, err := ss.cs.AllSessions()
+	if err != nil {
+		log.Printf("[alias] reconcile: failed to list sessions: %v", err)
+		return 0
+	}
+	collapsed := 0
+	for _, r := range records {
+		if isAPIToken(r.ClientID) {
+			continue // never retire a configured API token's own session
+		}
+		owner, ok := canonicalByUser[strings.ToLower(r.User)]
+		if !ok || owner == r.ClientID {
+			continue // no canonical account session, or this already is it
+		}
+		if aliases != nil {
+			aliases.Add(r.ClientID, owner)
+		}
+		ss.DropSession(r.ClientID)
+		collapsed++
+		log.Printf("[alias] collapsed duplicate session %s… for %q onto canonical owner", r.ClientID[:min(8, len(r.ClientID))], r.User)
+	}
+	return collapsed
+}

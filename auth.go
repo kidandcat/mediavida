@@ -143,7 +143,7 @@ button:hover{background:#1a4a8a}
 // concurrent Mediavida login per account and triggered guard/login storms, so a
 // watch token instead resolves to its owner's client ID here — one MV session
 // per account, shared by the phone and the watch.
-func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, watchTokens *WatchTokenStore, next http.Handler) http.Handler {
+func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, watchTokens *WatchTokenStore, appAliases *AppAliasStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -166,10 +166,14 @@ func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, wat
 				return
 			}
 			if sess == nil {
-				// Otherwise it may be a watch token — resolve it to its owner so it
-				// reuses the owner's single MV session.
+				// Otherwise it may be an alias — a watch token or a phone device
+				// token — that reuses its owner's single MV session. Resolve it to
+				// the owner clientID so there is only ever one MV login per account.
 				owner, ok := "", false
-				if watchTokens != nil {
+				if appAliases != nil {
+					owner, ok = appAliases.Owner(token)
+				}
+				if !ok && watchTokens != nil {
 					owner, ok = watchTokens.Owner(token)
 				}
 				ownerSess, oerr := lookupSession(sessions, owner)
@@ -193,8 +197,9 @@ func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, wat
 // RegisterAppLoginHandler wires POST /auth/app-login: a per-device login where
 // the app supplies its own bearer token plus the user's Mediavida credentials.
 // Gated by the APP_KEY env var (anti-abuse) when set. No bearer needed.
-func RegisterAppLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
+func RegisterAppLoginHandler(mux *http.ServeMux, sessions *SessionStore, appAliases *AppAliasStore, validTokens map[string]bool) {
 	appKey := os.Getenv("APP_KEY")
+	isAPIToken := func(id string) bool { return validTokens[id] }
 	mux.HandleFunc("POST /auth/app-login", func(w http.ResponseWriter, r *http.Request) {
 		if appKey != "" && r.Header.Get("X-App-Key") != appKey {
 			writeError(w, http.StatusUnauthorized, "invalid app key")
@@ -214,6 +219,26 @@ func RegisterAppLoginHandler(mux *http.ServeMux, sessions *SessionStore) {
 		if req.Token == "" || req.User == "" || req.Pass == "" {
 			writeError(w, http.StatusBadRequest, "token, user and pass are required")
 			return
+		}
+
+		// One MV session per account: if the server already holds a session for
+		// this account (its own boot session, or another device's), alias this
+		// device token onto it instead of spawning a second concurrent MV login.
+		// Two logins for the same account fight for the single session MV allows
+		// and knock each other out in a perpetual re-login storm (the app was
+		// stuck on 503 because its duplicate session kept losing that fight). Only
+		// alias when the supplied credentials match the session we hold, so this
+		// never leaks the account to a caller that couldn't have logged in itself;
+		// otherwise fall through to a normal (verifying) login.
+		if owner, ok := sessions.CanonicalForUser(req.User, isAPIToken); ok {
+			if canon := sessions.Get(owner); canon != nil && canon.Scraper != nil &&
+				canon.Scraper.MatchesCredentials(req.User, req.Pass) {
+				sessions.DropSession(req.Token) // retire any stale own-session under this device token
+				appAliases.Add(req.Token, owner)
+				log.Printf("[alias] app-login for %q aliased device token onto existing account session", req.User)
+				writeJSON(w, http.StatusOK, loginResponse{Status: "authenticated", Username: req.User})
+				return
+			}
 		}
 
 		err := sessions.CreateFromCredentials(req.Token, req.User, req.Pass)

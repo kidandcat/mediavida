@@ -191,6 +191,18 @@ func (cs *ColmenaStore) migrate() error {
 			label      TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL
 		)`,
+		// app_aliases maps a phone's per-install device token to the single MV
+		// session for its account (the owner clientID), mirroring watch_tokens.
+		// A device token used to get its OWN MV session (a full second login for
+		// the same account), which fought the server's boot session for the one
+		// Mediavida session MV allows per account — a perpetual mutual-logout
+		// storm that left the app stuck on 503. It now aliases the shared session
+		// instead: one MV login per account, shared by boot/phone/watch.
+		`CREATE TABLE IF NOT EXISTS app_aliases (
+			token      TEXT PRIMARY KEY,
+			owner      TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := cs.db.Exec(s); err != nil {
@@ -544,6 +556,33 @@ func (cs *ColmenaStore) GetWatchTokenOwner(token string) (string, bool, error) {
 // DeleteWatchToken removes a paired-watch token (revocation).
 func (cs *ColmenaStore) DeleteWatchToken(token string) error {
 	_, err := cs.db.Exec(`DELETE FROM watch_tokens WHERE token = ?`, token)
+	return err
+}
+
+// AddAppAlias records that a phone device token aliases the given owner's MV
+// session (idempotent; re-pointing an existing token updates the owner).
+func (cs *ColmenaStore) AddAppAlias(token, owner string) error {
+	_, err := cs.db.Exec(
+		`INSERT INTO app_aliases (token, owner, created_at) VALUES (?, ?, ?)
+		 ON CONFLICT(token) DO UPDATE SET owner=excluded.owner`,
+		token, owner, time.Now().Unix(),
+	)
+	return err
+}
+
+// GetAppAliasOwner resolves a device token to its owner (ok=false if absent).
+func (cs *ColmenaStore) GetAppAliasOwner(token string) (string, bool, error) {
+	var owner string
+	err := cs.db.QueryRow(`SELECT owner FROM app_aliases WHERE token = ?`, token).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return owner, err == nil, err
+}
+
+// DeleteAppAlias removes a device-token alias.
+func (cs *ColmenaStore) DeleteAppAlias(token string) error {
+	_, err := cs.db.Exec(`DELETE FROM app_aliases WHERE token = ?`, token)
 	return err
 }
 

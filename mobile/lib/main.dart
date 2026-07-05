@@ -33,8 +33,18 @@ Future<void> main() async {
     // app. 80 MB is plenty for a scrolling thread of downsampled images.
     PaintingBinding.instance.imageCache.maximumSizeBytes = 80 << 20; // 80 MB
 
-    await NotificationService().initialize();
+    // Render immediately; never block the first frame on push/FCM init. A hung
+    // or throwing FCM/Play-Services init here used to keep runApp from ever
+    // running, leaving the app stuck forever on the splash ("cargando
+    // indefinidamente"). Initialize notifications in the background, time-boxed
+    // and guarded, so a push/FCM failure can't block startup. Push still
+    // re-registers on login via the configProvider listener in MvApp.
     runApp(const ProviderScope(child: MvApp()));
+
+    unawaited(NotificationService()
+        .initialize()
+        .timeout(const Duration(seconds: 8))
+        .catchError((Object e, StackTrace st) => debugPrint('[notif:init] $e')));
   }, (error, stack) {
     debugPrint('[uncaught:zone] $error\n$stack');
   });

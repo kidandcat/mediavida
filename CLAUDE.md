@@ -16,8 +16,11 @@ resources in the wrong org.
 - **gcloud / Firebase / FCM:** `kidandcat@gmail.com`.
 
 ```sh
-# gcloud → personal
-gcloud config set account kidandcat@gmail.com
+# gcloud → personal. NEVER `gcloud config set account` — it mutates the active
+# named config on disk and races parallel work/personal agents. Select the
+# account per-process instead:
+export CLOUDSDK_ACTIVE_CONFIG_NAME=personal   # or prefix a single command with it
+gcloud config get-value account               # must print kidandcat@gmail.com
 
 # firebase CLI keeps its own login, separate from gcloud. Verify / select:
 firebase login:list

@@ -83,29 +83,29 @@ func main() {
 		log.Printf("Loaded %d API token(s)", len(apiTokens))
 	}
 
-	// Colmena: durable Raft-replicated store. This is the ONLY persistence layer
-	// (no JSON-on-volume fallback, no enable gate). StartColmena never returns nil
-	// — in a Fly cluster it forms/joins Raft, otherwise it runs a single local
-	// bootstrap node for dev. All stores below are backed by it.
-	colmenaStore := StartColmena()
+	// Durable store: a single local SQLite file (pure-Go modernc driver). This is
+	// the ONLY persistence layer (no JSON-on-volume fallback, no enable gate).
+	// OpenStore never returns nil — it log.Fatals on any hard open error. All
+	// stores below are backed by it.
+	store := OpenStore()
 
-	sessions := NewSessionStore(colmenaStore)
-	webhooks := NewWebhookStore(colmenaStore)
-	modForums := NewModForumsStore(colmenaStore)
+	sessions := NewSessionStore(store)
+	webhooks := NewWebhookStore(store)
+	modForums := NewModForumsStore(store)
 	hub := NewEventHub()
 
-	// Rehydrate every durable session from Colmena (per-device app-login tokens
+	// Rehydrate every durable session from the store (per-device app-login tokens
 	// included, not just the configured API tokens), so logins survive restarts
 	// and redeploys. This replaces the old per-token JSON-on-disk restore loop.
 	if n := sessions.RestoreAll(); n > 0 {
-		log.Printf("Restored %d session(s) from Colmena", n)
+		log.Printf("Restored %d session(s) from the store", n)
 	}
 
 	// For any configured API token that still has no live session (e.g. a fresh
-	// cluster with an empty Raft log), fall back to a headless auto-login using
+	// deploy with an empty DB), fall back to a headless auto-login using
 	// MV_USERNAME/MV_PASSWORD (+ MV_TOTP_SECRET for guard) so the server is
-	// authenticated without any manual step. RestoreSession re-checks Colmena per
-	// token in case it wasn't picked up above.
+	// authenticated without any manual step. RestoreSession re-checks the store
+	// per token in case it wasn't picked up above.
 	envUser, envPass := os.Getenv("MV_USERNAME"), os.Getenv("MV_PASSWORD")
 	for token := range apiTokens {
 		short := token[:min(16, len(token))]
@@ -129,7 +129,7 @@ func main() {
 	// stuck re-logging in — 503 forever. Collapse any such duplicate onto the
 	// canonical (API-token) session and re-point its device token as an alias, so
 	// existing installs recover without the user having to log in again.
-	appAliases := NewAppAliasStore(colmenaStore)
+	appAliases := NewAppAliasStore(store)
 	isAPIToken := func(id string) bool { return apiTokens[id] }
 	if n := sessions.ReconcileAccountSessions(isAPIToken, appAliases); n > 0 {
 		log.Printf("Collapsed %d duplicate account session(s) onto their canonical owner", n)
@@ -155,17 +155,17 @@ func main() {
 
 	// FCM push (nil if FCM_SA_JSON/FCM_PROJECT_ID unset). Per-device tokens are
 	// registered via POST /push/register.
-	fcmTokens := NewFCMTokenStore(colmenaStore)
-	watchTokens := NewWatchTokenStore(colmenaStore)
+	fcmTokens := NewFCMTokenStore(store)
+	watchTokens := NewWatchTokenStore(store)
 	fcmSender := NewFCMSender(fcmTokens)
 
 	// Durable mirror of unseen avisos — decouples the in-app badge from MV's bn,
 	// which the poller clears when it fetches /notificaciones to enrich a push.
-	pendingNotifs := NewPendingNotifStore(colmenaStore)
+	pendingNotifs := NewPendingNotifStore(store)
 
 	// Start bubbles poller for SSE/webhook push notifications. Mod-forum
 	// subscriptions are per-user and configured via /mod/forums.
-	poller := NewBubblesPoller(colmenaStore, hub, sessions, webhooks, telegramBot, ntfyPub, fcmSender, pendingNotifs, modForums)
+	poller := NewBubblesPoller(store, hub, sessions, webhooks, telegramBot, ntfyPub, fcmSender, pendingNotifs, modForums)
 	poller.Start()
 
 	// Start session keepalive to prevent cookies from expiring during idle periods
@@ -189,11 +189,10 @@ func main() {
 	apiHandler := APITokenMiddleware(apiTokens, sessions, watchTokens, appAliases, limiter.Middleware(apiMux))
 
 	root := http.NewServeMux()
-	// Health check for Fly's rolling deploy (keeps Raft quorum). 200 once this
-	// node is caught up; 503 while a cluster node is still joining. Local dev mode
-	// is always healthy as soon as the bootstrap node is up.
+	// Health check: a plain DB ping. 200 while the SQLite store answers queries,
+	// 503 otherwise.
 	root.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if colmenaStore.Healthy() {
+		if store.Healthy() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok")) // safe-ignore: best-effort health body
 			return
@@ -227,7 +226,7 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown: Fly sends SIGTERM before replacing/killing the machine.
+	// Graceful shutdown: systemd sends SIGTERM before killing the process.
 	// Stop the background loops first so they can't publish to SSE channels that
 	// are mid-drain, end the SSE streams, then let in-flight requests finish.
 	sigCh := make(chan os.Signal, 1)
@@ -244,10 +243,7 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("graceful shutdown timed out: %v", err)
 	}
-	// Leave the Raft cluster last (transfers leadership) so a rolling deploy
-	// keeps quorum. In local dev mode this just closes the node.
-	leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 8*time.Second)
-	colmenaStore.Leave(leaveCtx)
-	leaveCancel()
+	// Close the store last, once nothing can write to it anymore.
+	store.Close()
 	log.Println("shutdown complete")
 }

@@ -231,7 +231,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeJSON(w, http.StatusOK, statusResponse{Status: "unauthenticated"})
 			return
 		}
-		// Do NOT probe MV here. A live session row in Colmena (rehydrated by
+		// Do NOT probe MV here. A live session row in the store (rehydrated by
 		// sessions.Get) is enough to report "authenticated". Probing MV on every
 		// status check made a transient upstream failure (anti-bot challenge,
 		// rate-limit, network) report "unauthenticated" and kick the user to the

@@ -18,14 +18,14 @@ type Session struct {
 
 // SessionStore manages per-client sessions keyed by client ID (API token).
 // The in-memory map is the hot path; durable persistence is delegated entirely
-// to the Raft-replicated Colmena store (cs) — there is no JSON-on-disk fallback.
+// to the SQLite store (cs) — there is no JSON-on-disk fallback.
 type SessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session // clientID → session
-	cs       *ColmenaStore       // durable, Raft-replicated persistence
+	cs       *Store              // durable SQLite persistence
 }
 
-func NewSessionStore(cs *ColmenaStore) *SessionStore {
+func NewSessionStore(cs *Store) *SessionStore {
 	return &SessionStore{
 		sessions: make(map[string]*Session),
 		cs:       cs,
@@ -33,7 +33,7 @@ func NewSessionStore(cs *ColmenaStore) *SessionStore {
 }
 
 // errSessionStoreUnavailable marks a TRANSIENT failure to read the durable
-// session store (Colmena leader election, quorum loss, network blip), as opposed
+// session store (a disk/database error on the SQLite file), as opposed
 // to the session genuinely not existing. Auth gates must map this to a retryable
 // 503 — never a 401 — so a momentary store hiccup doesn't kick the user to the
 // login screen even though their session is perfectly valid.
@@ -42,7 +42,7 @@ var errSessionStoreUnavailable = errors.New("session store temporarily unavailab
 // Get returns a session by client ID, or nil when none is active. It does NOT
 // distinguish "no session" from a transient store failure — callers gating
 // authentication should use [Lookup] instead so they can return 503 (retry)
-// rather than 401 (logout) on a transient Colmena read error.
+// rather than 401 (logout) on a transient store read error.
 func (ss *SessionStore) Get(clientID string) *Session {
 	s, _ := ss.Lookup(clientID) // safe-ignore: Get intentionally collapses "no session" and "store unavailable" to nil; callers needing the distinction use Lookup
 	return s
@@ -67,10 +67,9 @@ func (ss *SessionStore) Lookup(clientID string) (*Session, error) {
 	if s != nil {
 		return s, nil
 	}
-	// Multi-node cluster: the session may have been created on another node and
-	// only live in Raft (this node's in-memory map is per-process). Lazily
-	// rehydrate from Colmena so any node can serve any device — without this, a
-	// login on node A followed by a request routed to node B looks unauthenticated.
+	// The session may only exist as a durable record (the in-memory map is
+	// per-process). Lazily rehydrate from the store so a device that logged in
+	// before a restart is served without looking unauthenticated.
 	ok, err := ss.restoreSessionE(clientID)
 	if err != nil {
 		return nil, err
@@ -90,7 +89,7 @@ func (ss *SessionStore) Set(clientID string, s *Session) {
 	ss.sessions[clientID] = s
 }
 
-// RestoreSession tries to load a durable session from Colmena for the given
+// RestoreSession tries to load a durable session from the store for the given
 // client ID. Validates the session is still active; if expired, attempts
 // re-login. Returns true if a session was successfully restored.
 func (ss *SessionStore) RestoreSession(clientID string) bool {
@@ -100,8 +99,8 @@ func (ss *SessionStore) RestoreSession(clientID string) bool {
 
 // restoreSessionE is [RestoreSession] that also reports a TRANSIENT store-read
 // failure (errSessionStoreUnavailable) distinctly from "no session on record"
-// ((false, nil)). A failed read of Colmena must NOT be mistaken for a logged-out
-// device — that was the cause of spurious logouts on every Colmena blip.
+// ((false, nil)). A failed read of the store must NOT be mistaken for a logged-out
+// device — that was the cause of spurious logouts on every store blip.
 func (ss *SessionStore) restoreSessionE(clientID string) (bool, error) {
 	if ss.cs == nil {
 		return false, nil
@@ -140,8 +139,8 @@ func (ss *SessionStore) restoreFromRecord(rec SessionRecord) bool {
 	}
 
 	// IMPORTANT: do NOT probe MV here (no ValidateSession). The cookies in
-	// Colmena are the freshest copy in the cluster, so we trust them and mark
-	// the session authenticated immediately. Probing MV on every cross-node
+	// the store are the freshest copy we have, so we trust them and mark
+	// the session authenticated immediately. Probing MV on every
 	// rehydration was the cause of spurious logouts: any transient failure of
 	// that HTTP call (anti-bot challenge, rate-limit, 5xx, network) made us
 	// discard a perfectly valid session and kick the user to the login screen.
@@ -155,7 +154,7 @@ func (ss *SessionStore) restoreFromRecord(rec SessionRecord) bool {
 	ss.mu.Lock()
 	ss.sessions[rec.ClientID] = session
 	ss.mu.Unlock()
-	log.Printf("Session restored from Colmena for client %s", rec.ClientID)
+	log.Printf("Session restored from store for client %s", rec.ClientID)
 	return true
 }
 
@@ -237,7 +236,7 @@ func (ss *SessionStore) AutoLogin(clientID, user, pass string) error {
 	return nil
 }
 
-// RestoreAll rehydrates every durable session from the Colmena store (including
+// RestoreAll rehydrates every durable session from the store (including
 // per-device app-login tokens, not just the configured API tokens). Returns the
 // number of sessions restored. Call once at boot so logins survive restarts.
 func (ss *SessionStore) RestoreAll() int {
@@ -246,7 +245,7 @@ func (ss *SessionStore) RestoreAll() int {
 	}
 	records, err := ss.cs.AllSessions()
 	if err != nil {
-		log.Printf("Failed to list sessions from Colmena: %v", err)
+		log.Printf("Failed to list sessions from store: %v", err)
 		return 0
 	}
 	n := 0

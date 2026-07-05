@@ -73,12 +73,12 @@ type ForumScraper struct {
 	lastSaveTime time.Time // tracks last session save to avoid excessive writes
 	totpSecret   string    // base32 TOTP secret for automatic guard verification
 
-	// cs is the durable, Raft-replicated store — the ONLY persistence layer.
+	// cs is the durable SQLite store — the ONLY persistence layer.
 	// There is no JSON-on-disk fallback.
-	cs *ColmenaStore
+	cs *Store
 	// lastCookieFingerprint is a hash of ONLY the auth cookies as of the last
 	// PutSession. SaveSession is called frequently (the poller fires it every
-	// ~20 polls and on every change), so we debounce writes to the Raft log:
+	// ~20 polls and on every change), so we debounce the durable writes:
 	// we only PutSession when this fingerprint actually changes. Guarded by mu.
 	lastCookieFingerprint string
 }
@@ -164,7 +164,7 @@ func newChromeTransport() http.RoundTripper {
 	}
 }
 
-func NewForumScraper(user, pass, clientID string, cs *ColmenaStore) *ForumScraper {
+func NewForumScraper(user, pass, clientID string, cs *Store) *ForumScraper {
 	jar, _ := cookiejar.New(nil) // safe-ignore: cookiejar.New(nil) never returns an error
 	return &ForumScraper{
 		client: &http.Client{
@@ -376,7 +376,7 @@ type savedCookie struct {
 // authCookieFingerprint returns a stable hash over ONLY the auth-relevant
 // cookies (sess, _t, remember-style). These are the cookies whose change marks
 // a materially-different session (login / guard / re-login); everything else
-// (CSRF, per-page churn) must NOT trigger a Raft write.
+// (CSRF, per-page churn) must NOT trigger a durable write.
 func authCookieFingerprint(cookies []*http.Cookie) string {
 	// Collect name=value for the auth cookies, sorted by name for stability.
 	var pairs []string
@@ -401,11 +401,11 @@ func isAuthCookie(name string) bool {
 	return strings.Contains(lower, "sess") || strings.Contains(lower, "remember")
 }
 
-// SaveSession persists cookies and credentials to the durable Colmena store so
+// SaveSession persists cookies and credentials to the durable store so
 // the user doesn't need to log in every time.
 //
 // ANTI-CHURN: this is called frequently (the poller fires it every ~20 polls
-// and on every change). Writing to the Raft log each time would flood it, so we
+// and on every change). Writing the row each time would be pointless churn, so we
 // only call cs.PutSession when the fingerprint of the AUTH cookies actually
 // changed since the last save. Per-poll refreshes of non-auth cookies are a
 // no-op here.
@@ -471,7 +471,7 @@ func (s *ForumScraper) AutoSave() {
 	}
 }
 
-// LoadSession restores cookies and credentials from the durable Colmena store.
+// LoadSession restores cookies and credentials from the durable store.
 // Returns true if a session was loaded.
 func (s *ForumScraper) LoadSession() bool {
 	if s.cs == nil {
@@ -534,7 +534,7 @@ func (s *ForumScraper) loadFromRecord(rec SessionRecord) bool {
 	s.lastCookieFingerprint = fp
 	s.mu.Unlock()
 	s.setLoggedIn(true)
-	log.Printf("Session restored from Colmena (user: %s, %d cookies)", s.user, len(cookies))
+	log.Printf("Session restored from store (user: %s, %d cookies)", s.user, len(cookies))
 	return true
 }
 
@@ -555,20 +555,18 @@ func (s *ForumScraper) ClearSession() {
 	s.client.Jar = jar
 }
 
-// ValidateSession checks if the current session is actually valid by making
-// a lightweight request to the bubbles endpoint.
+// ValidateSession checks whether the session cookies are actually valid by
+// asking MV itself, deliberately ignoring the in-memory isLoggedIn flag: this
+// is called precisely to correct that flag after a suspected false expiry.
+//
+// bubbles.php is useless as a discriminator (it returns `[]` both for
+// anonymous callers and for a logged-in account with zero notifications —
+// misreading that as "logged out" is what used to poison the flag). The
+// reliable signal is GET /login: logged-in sessions are redirected away to
+// the profile (/id/<user>) and never see the CSRF login form, while anonymous
+// callers get the form.
 func (s *ForumScraper) ValidateSession() bool {
-	if !s.isLoggedIn() {
-		return false
-	}
-	req, err := http.NewRequest("GET", "https://www.mediavida.com/usuarios/action/bubbles.php", nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	resp, err := s.client.Do(req)
+	resp, err := s.doGet("https://www.mediavida.com/login")
 	if err != nil {
 		return false
 	}
@@ -576,21 +574,24 @@ func (s *ForumScraper) ValidateSession() bool {
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
+	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.Path != "/login" {
+		// Redirected away from the form → MV considers us logged in.
+		return true
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false
 	}
-	trimmed := strings.TrimSpace(string(body))
-	// HTML response or empty means session is invalid
-	if len(trimmed) == 0 || trimmed[0] == '<' {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	if err != nil {
 		return false
 	}
-	// Empty JSON array also means not logged in
-	var arr []int
-	if json.Unmarshal(body, &arr) == nil && len(arr) == 0 {
+	// Still on /login: valid only if the page carries no login form (edge
+	// CDNs sometimes rewrite without redirecting) AND shows a logout link.
+	if _, hasForm := doc.Find("#_token").Attr("value"); hasForm {
 		return false
 	}
-	return true
+	return doc.Find(`a[href*="logout"]`).Length() > 0
 }
 
 // LikeMessage sends a "mano" (like) to a post via POST /foro/post_mola.php.
@@ -1738,7 +1739,7 @@ func (s *ForumScraper) Relogin() error {
 	// (~weeks). The user only re-enters a TOTP code when the remember cookie
 	// itself expires.
 	//
-	// Crucially this does NOT call ClearSession. Deleting the durable Colmena
+	// Crucially this does NOT call ClearSession. Deleting the durable
 	// record (and wiping the remember cookie) on what is usually a transient
 	// upstream failure (anti-bot challenge, rate-limit, network blip) was what
 	// kicked users back to the login screen: it threw away the very cookie that

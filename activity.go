@@ -9,16 +9,16 @@ import (
 )
 
 // PendingNotifStore is the durable mirror of a device's unseen MV notifications,
-// backed by Colmena. It exists because enriching a mention push forces us to
+// backed by the durable SQLite store. It exists because enriching a mention push forces us to
 // fetch /notificaciones (which marks everything seen on MV), so the in-app
 // "avisos" badge can no longer be read from MV's bn. The badge is driven from
 // this store instead and cleared when the app opens the notifications feed.
 type PendingNotifStore struct {
-	cs *ColmenaStore
+	cs *Store
 }
 
-// NewPendingNotifStore builds a pending-notification store on the Colmena cluster.
-func NewPendingNotifStore(cs *ColmenaStore) *PendingNotifStore {
+// NewPendingNotifStore builds a pending-notification store on the durable SQLite store.
+func NewPendingNotifStore(cs *Store) *PendingNotifStore {
 	return &PendingNotifStore{cs: cs}
 }
 

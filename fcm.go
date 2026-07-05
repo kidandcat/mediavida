@@ -19,15 +19,15 @@ import (
 )
 
 // FCMTokenStore maps a client (device bearer token) to its FCM registration
-// tokens, durably persisted via Colmena (Raft). A client can have more than one
+// tokens, durably persisted in the durable SQLite store. A client can have more than one
 // token (reinstalls, token refresh) until the stale ones are pruned on send
 // failure.
 type FCMTokenStore struct {
-	cs *ColmenaStore
+	cs *Store
 }
 
-// NewFCMTokenStore builds a token store backed by the Colmena cluster.
-func NewFCMTokenStore(cs *ColmenaStore) *FCMTokenStore {
+// NewFCMTokenStore builds a token store backed by the durable SQLite store.
+func NewFCMTokenStore(cs *Store) *FCMTokenStore {
 	return &FCMTokenStore{cs: cs}
 }
 

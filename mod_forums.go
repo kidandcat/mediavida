@@ -9,15 +9,15 @@ import (
 // ModForumsStore tracks which subforums each MV user wants to monitor for mod
 // alerts. Each entry is per mv_username so the same setup auto-routes via the
 // existing per-username Telegram chat registry. Subscriptions are persisted in
-// Colmena (cs.AddModForum/RemoveModForum/GetModForums); the in-memory map is a
-// write-through cache hydrated from Colmena at startup.
+// the store (cs.AddModForum/RemoveModForum/GetModForums); the in-memory map is a
+// write-through cache hydrated from the store at startup.
 type ModForumsStore struct {
-	cs     *ColmenaStore
+	cs     *Store
 	mu     sync.RWMutex
 	forums map[string][]string // mv_username → slug list (sorted, deduped)
 }
 
-func NewModForumsStore(cs *ColmenaStore) *ModForumsStore {
+func NewModForumsStore(cs *Store) *ModForumsStore {
 	s := &ModForumsStore{cs: cs, forums: make(map[string][]string)}
 	s.load()
 	return s
@@ -37,7 +37,7 @@ func (s *ModForumsStore) load() {
 		s.forums[username] = list
 	}
 	s.mu.Unlock()
-	log.Printf("[mod-forums] restored config for %d user(s) from colmena", len(all))
+	log.Printf("[mod-forums] restored config for %d user(s) from store", len(all))
 }
 
 // Get returns a copy of the slug list for a user.

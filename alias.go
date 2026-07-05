@@ -4,17 +4,17 @@ import "log"
 
 // AppAliasStore is the durable registry mapping a phone's per-install device
 // token to the single MV session for its account (the owner clientID), backed
-// by Colmena. It mirrors WatchTokenStore: an aliased token has NO MV session of
+// by the durable SQLite store. It mirrors WatchTokenStore: an aliased token has NO MV session of
 // its own — it resolves to the owner's session at request time (see
 // APITokenMiddleware), so there is only ever one Mediavida login per account no
 // matter how many phones/watches use it. Duplicating the session per device was
 // what triggered the mutual-logout storm that left the app stuck on 503.
 type AppAliasStore struct {
-	cs *ColmenaStore
+	cs *Store
 }
 
-// NewAppAliasStore builds an app-alias store backed by the Colmena cluster.
-func NewAppAliasStore(cs *ColmenaStore) *AppAliasStore {
+// NewAppAliasStore builds an app-alias store backed by the durable SQLite store.
+func NewAppAliasStore(cs *Store) *AppAliasStore {
 	return &AppAliasStore{cs: cs}
 }
 

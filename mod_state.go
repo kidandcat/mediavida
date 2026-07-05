@@ -3,7 +3,7 @@ package main
 // Mod-tracking prev-counters (prevMod/prevReports) are EPHEMERAL change-detection
 // state: they re-baseline on every restart so the poller never re-alerts on
 // reports/messages already surfaced. They are intentionally NOT persisted — not
-// to Colmena, not to disk. loadModState always starts empty; marshalModState and
+// to the durable store, not to disk. loadModState always starts empty; marshalModState and
 // writeModState are no-ops kept only so the existing caller in bubbles.go
 // (persistModState) compiles unchanged.
 

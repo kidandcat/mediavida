@@ -8,8 +8,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/mentasystems/colmena/jobs"
 )
 
 const (
@@ -17,26 +15,18 @@ const (
 	saveEveryN    = 20 // save session to disk every N polls (~10 min at 30s interval)
 	refreshEveryN = 10 // refresh session via main page every N polls (~5 min at 30s interval)
 
-	pollWorkers    = 16 // per-node worker goroutines draining poll_session jobs
+	pollWorkers    = 16 // worker goroutines draining poll-session jobs
 	breakerMaxSkip = 16 // max consecutive ticks a failing session is skipped (~8 min)
 	pushQueueSize  = 4096
 	pushWorkers    = 8
+	pollQueueSize  = 4096 // buffered poll-job queue (one entry per session per tick)
 
-	// pollJobType is the colmena job type for a single per-session bubble scrape.
-	// Every tick enqueues one job of this type per authenticated session; the
-	// cluster-wide rate limit below bounds the AGGREGATE request rate toward
-	// mediavida.com across ALL nodes (the claim-time check is race-safe via Raft).
-	pollJobType = "poll_session"
-
-	// pollRatePerSec is the cluster-wide budget of bubble scrapes that may START
-	// per second across the whole fleet. Conservative on purpose: mediavida.com is
-	// a third party we must not hammer. At 20/s a 600-session fleet drains in ~30s,
-	// matching the 30s tick — larger fleets simply spread their scrapes out over
-	// more ticks rather than bursting. Tune via SetRateLimit if MV tolerates more.
+	// pollRatePerSec is the budget of bubble scrapes that may START per second.
+	// Conservative on purpose: mediavida.com is a third party we must not hammer.
+	// At 20/s a 600-session set drains in ~30s, matching the 30s tick — larger
+	// sets simply spread their scrapes out over more ticks rather than bursting.
+	// Enforced by a shared ticker the workers block on before each scrape.
 	pollRatePerSec = 20
-
-	// pollJobTimeout caps a single scrape attempt (fetch + possible relogin).
-	pollJobTimeout = 25 * time.Second
 )
 
 // breakerState backs off a session that keeps failing so a banned/slow endpoint
@@ -60,7 +50,7 @@ type pushJob struct {
 // BubblesPoller polls bubbles.php for each authenticated session and broadcasts
 // changes via the EventHub (SSE) and configured outgoing webhooks.
 type BubblesPoller struct {
-	cs        *ColmenaStore // durable store — its node backs the jobs.Manager
+	cs        *Store // durable store (badge/pending reads on the poll path)
 	hub       *EventHub
 	sessions  *SessionStore
 	webhooks  *WebhookStore
@@ -70,12 +60,19 @@ type BubblesPoller struct {
 	pending   *PendingNotifStore // durable mirror of unseen avisos (badge source)
 	modForums *ModForumsStore    // per-mv-user subforum subscriptions
 
-	// jobs is the colmena jobs manager that runs poll_session jobs under a
-	// cluster-wide rate limit. Built in Start() from cs.Node(). It may also be
-	// injected via SetJobsManager before Start() (e.g. when main.go owns a single
-	// shared manager); if nil at Start() the poller creates its own.
-	jobs     *jobs.Manager
-	ownsJobs bool // true when Start() created bp.jobs (so Stop() must Close it)
+	// In-process poll worker pool (replaces the former colmena distributed jobs
+	// queue — single node now, no distribution needed). Every tick enqueues one
+	// pollJobArgs per authenticated session onto pollCh; pollWorkers goroutines
+	// drain it, each blocking on pollLimiter (a shared ticker at 1/pollRatePerSec)
+	// before starting a scrape, so the aggregate request rate toward
+	// mediavida.com stays bounded. inflight dedups per client: a session whose
+	// previous scrape is still queued/running is skipped that tick.
+	pollCh      chan pollJobArgs
+	pollWG      sync.WaitGroup
+	pollLimiter *time.Ticker
+
+	inflightMu sync.Mutex
+	inflight   map[string]bool // clientID → a poll job is queued or running
 
 	mu     sync.Mutex
 	stopCh chan struct{}
@@ -96,10 +93,9 @@ type BubblesPoller struct {
 	pushWG sync.WaitGroup
 }
 
-// NewBubblesPoller builds the poller. cs is the durable Colmena store whose node
-// backs the jobs.Manager used for cluster-wide rate limiting of MV scrapes; it
-// must be non-nil (Colmena is the only persistence layer — no fallback).
-func NewBubblesPoller(cs *ColmenaStore, hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, ntfy *NtfyPublisher, fcm *FCMSender, pending *PendingNotifStore, modForums *ModForumsStore) *BubblesPoller {
+// NewBubblesPoller builds the poller. cs is the durable SQLite store; it must
+// be non-nil (it is the only persistence layer — no fallback).
+func NewBubblesPoller(cs *Store, hub *EventHub, sessions *SessionStore, webhooks *WebhookStore, telegram *TelegramBot, ntfy *NtfyPublisher, fcm *FCMSender, pending *PendingNotifStore, modForums *ModForumsStore) *BubblesPoller {
 	prevMod, prevReports := loadModState()
 	return &BubblesPoller{
 		cs:          cs,
@@ -117,19 +113,8 @@ func NewBubblesPoller(cs *ColmenaStore, hub *EventHub, sessions *SessionStore, w
 		prevReports: prevReports,
 		breaker:     make(map[string]*breakerState),
 		gated:       make(map[string]bool),
+		inflight:    make(map[string]bool),
 	}
-}
-
-// SetJobsManager lets the integrator inject a pre-built, shared jobs.Manager
-// (e.g. one main.go also uses for other job types) instead of letting Start()
-// create a poller-owned one. Must be called before Start(). When a manager is
-// injected this way, Stop() will NOT close it — its lifecycle stays with the
-// owner. When Start() builds its own, Stop() closes it.
-func (bp *BubblesPoller) SetJobsManager(m *jobs.Manager) {
-	bp.mu.Lock()
-	defer bp.mu.Unlock()
-	bp.jobs = m
-	bp.ownsJobs = false
 }
 
 // persistModState snapshots the mod-tracking maps to disk. Called after any
@@ -143,11 +128,11 @@ func (bp *BubblesPoller) persistModState() {
 
 // Start begins polling bubbles.php in a background goroutine.
 //
-// The per-session scrape now runs as a colmena "poll_session" job: every tick
-// enqueues one job per authenticated session and a cluster-wide rate limit on
-// the job type bounds the AGGREGATE request rate toward mediavida.com across all
-// nodes. The actual scrape (FetchBubbles / Relogin / diff / notify / async push)
-// happens in the registered handler, which is exactly what checkOne did before.
+// The per-session scrape runs on an in-process worker pool: every tick
+// enqueues one poll job per authenticated session and the shared rate limiter
+// bounds the aggregate request rate toward mediavida.com. The actual scrape
+// (FetchBubbles / Relogin / diff / notify / async push) happens in
+// handlePollSession, which is exactly what checkOne did before.
 func (bp *BubblesPoller) Start() {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
@@ -156,34 +141,13 @@ func (bp *BubblesPoller) Start() {
 		return
 	}
 
-	// Build (or adopt) the jobs manager. The manager owns the per-node worker
-	// pool that drains poll_session jobs; cluster-wide ordering/limiting is
-	// enforced at claim time inside colmena, not here.
-	if bp.jobs == nil {
-		m, err := jobs.New(bp.cs.Node(), jobs.Config{
-			Workers:        pollWorkers,
-			DefaultTimeout: pollJobTimeout,
-		})
-		if err != nil {
-			// Dev: Colmena is the only persistence — fail loud, no fallback.
-			log.Fatalf("[bubbles] jobs.New: %v", err)
-		}
-		bp.jobs = m
-		bp.ownsJobs = true
-	}
-
-	// Register the per-session scrape handler. Registration must happen once;
-	// Start() is the single startup path so this is safe.
-	jobs.Register(bp.jobs, pollJobType, bp.handlePollSession)
-
-	// Cluster-wide rate limit: at most pollRatePerSec scrapes START per second
-	// across the ENTIRE fleet. This is the whole point of moving to jobs — the
-	// limit is shared, not per-node, so adding nodes never increases MV load.
-	if err := jobs.SetRateLimit(bp.jobs, pollJobType, jobs.Rate{N: pollRatePerSec, Per: time.Second}); err != nil {
-		log.Printf("[bubbles] SetRateLimit(%s): %v", pollJobType, err)
-	}
-
 	bp.stopCh = make(chan struct{})
+	bp.pollCh = make(chan pollJobArgs, pollQueueSize)
+	bp.pollLimiter = time.NewTicker(time.Second / pollRatePerSec)
+	for i := 0; i < pollWorkers; i++ {
+		bp.pollWG.Add(1)
+		go bp.pollWorker(bp.stopCh, bp.pollCh) // goroutine-ok: poll worker, drained on Stop via pollWG
+	}
 	bp.pushCh = make(chan pushJob, pushQueueSize)
 	for i := 0; i < pushWorkers; i++ {
 		bp.pushWG.Add(1)
@@ -193,7 +157,8 @@ func (bp *BubblesPoller) Start() {
 	go bp.dailySummaryLoop() // goroutine-ok: long-lived background loop, lives for the process lifetime (stopped via stopCh)
 }
 
-// Stop stops the polling goroutine and drains the async push workers.
+// Stop stops the polling goroutine and drains the poll and push workers (in
+// that order — poll workers are the only producers of push jobs).
 func (bp *BubblesPoller) Stop() {
 	bp.mu.Lock()
 	if bp.stopCh == nil {
@@ -202,27 +167,30 @@ func (bp *BubblesPoller) Stop() {
 	}
 	close(bp.stopCh)
 	bp.stopCh = nil
-	pushCh := bp.pushCh
-	bp.pushCh = nil
-	jm := bp.jobs
-	ownsJobs := bp.ownsJobs
-	if ownsJobs {
-		bp.jobs = nil
-	}
+	pollCh := bp.pollCh
+	bp.pollCh = nil
+	limiter := bp.pollLimiter
+	bp.pollLimiter = nil
 	bp.mu.Unlock()
 
-	// Close the push queue and wait for in-flight pushes to flush.
+	// Close the poll queue and wait for the workers to drain (stopCh is closed,
+	// so they discard queued jobs without scraping).
+	if pollCh != nil {
+		close(pollCh)
+		bp.pollWG.Wait()
+	}
+	if limiter != nil {
+		limiter.Stop()
+	}
+
+	// Now that no producer is left, close the push queue and flush in-flight pushes.
+	bp.mu.Lock()
+	pushCh := bp.pushCh
+	bp.pushCh = nil
+	bp.mu.Unlock()
 	if pushCh != nil {
 		close(pushCh)
 		bp.pushWG.Wait()
-	}
-
-	// Close the jobs manager only if we created it; an injected (shared) manager
-	// is the integrator's to close.
-	if ownsJobs && jm != nil {
-		if err := jm.Close(); err != nil {
-			log.Printf("[bubbles] jobs manager close: %v", err)
-		}
 	}
 }
 
@@ -274,7 +242,7 @@ func (bp *BubblesPoller) authedSessions() []sessionRef {
 }
 
 func (bp *BubblesPoller) poll() {
-	log.Printf("[bubbles] polling started (every %s, %d job-workers/node, cluster cap %d/s)",
+	log.Printf("[bubbles] polling started (every %s, %d job-workers, rate cap %d/s)",
 		pollInterval, pollWorkers, pollRatePerSec)
 
 	// Establish baseline for existing sessions (serial; one-time at startup).
@@ -303,21 +271,20 @@ func (bp *BubblesPoller) poll() {
 	}
 }
 
-// pollJobArgs is the JSON payload of a poll_session job. It carries only the
+// pollJobArgs is the payload of one poll-session job. It carries only the
 // clientID plus the per-tick save/refresh flags — the live *Session/*ForumScraper
-// is resolved locally in the handler (it is node-pinned state, never serialized).
+// is resolved in the handler (it is hot in-memory state, never serialized).
 type pollJobArgs struct {
-	ClientID string `json:"client_id"`
-	Save     bool   `json:"save"`
-	Refresh  bool   `json:"refresh"`
+	ClientID string
+	Save     bool
+	Refresh  bool
 }
 
-// check enqueues one poll_session job per authenticated session. The jobs are
-// drained by the colmena worker pool under a CLUSTER-WIDE rate limit, so the
-// aggregate request rate toward mediavida.com stays bounded no matter how many
-// nodes are running. WithUniqueKey(clientID) means a session whose previous
-// scrape is still pending/running won't pile up a second job — the tick is a
-// no-op for that client until the prior one finishes.
+// check enqueues one poll job per authenticated session. The jobs are drained
+// by the in-process worker pool under the shared rate limit, so the aggregate
+// request rate toward mediavida.com stays bounded. The inflight dedup means a
+// session whose previous scrape is still queued/running won't pile up a second
+// job — the tick is a no-op for that client until the prior one finishes.
 func (bp *BubblesPoller) check() {
 	// Counters advance once per tick (not per session) to keep intervals predictable.
 	bp.saveCounter++
@@ -326,38 +293,84 @@ func (bp *BubblesPoller) check() {
 	refresh := bp.refreshCounter%refreshEveryN == 0
 
 	bp.mu.Lock()
-	jm := bp.jobs
+	ch := bp.pollCh
 	bp.mu.Unlock()
-	if jm == nil {
+	if ch == nil {
 		return
 	}
 
 	for _, sr := range bp.authedSessions() {
-		args := pollJobArgs{ClientID: sr.clientID, Save: save, Refresh: refresh}
-		if _, err := jobs.Enqueue(jm, pollJobType, args,
-			jobs.WithUniqueKey(pollUniqueKey(sr.clientID)),
-			jobs.WithTimeout(pollJobTimeout),
-		); err != nil && err != jobs.ErrDuplicateUnique {
-			log.Printf("[bubbles] enqueue poll_session for %s: %v", sr.clientID, err)
+		if !bp.markInflight(sr.clientID) {
+			continue // previous scrape still queued/running — skip this tick
+		}
+		select {
+		case ch <- pollJobArgs{ClientID: sr.clientID, Save: save, Refresh: refresh}:
+		default:
+			bp.clearInflight(sr.clientID)
+			log.Printf("[bubbles] poll queue full, skipping %s this tick", sr.clientID)
 		}
 	}
 }
 
-// pollUniqueKey namespaces the per-client dedup key for poll_session jobs.
-func pollUniqueKey(clientID string) string { return "poll:" + clientID }
+// markInflight claims the per-client poll slot; false when a job for this
+// client is already queued or running (the dedup that replaces the former
+// distributed-queue unique key).
+func (bp *BubblesPoller) markInflight(clientID string) bool {
+	bp.inflightMu.Lock()
+	defer bp.inflightMu.Unlock()
+	if bp.inflight[clientID] {
+		return false
+	}
+	bp.inflight[clientID] = true
+	return true
+}
 
-// handlePollSession is the poll_session job handler. It resolves the (node-local)
-// session by clientID and runs the same per-session scrape checkOne did before.
-// Jobs are claimed under the cluster-wide rate limit, so this only runs within
-// the shared MV request budget. If the session isn't on this node (it migrated,
-// disconnected, or the job was claimed elsewhere) the job is a successful no-op.
-func (bp *BubblesPoller) handlePollSession(ctx jobs.Context, args pollJobArgs) error {
+// clearInflight releases the per-client poll slot.
+func (bp *BubblesPoller) clearInflight(clientID string) {
+	bp.inflightMu.Lock()
+	delete(bp.inflight, clientID)
+	bp.inflightMu.Unlock()
+}
+
+// pollWorker drains poll jobs off the queue, pacing scrape starts on the shared
+// rate limiter so the aggregate request rate toward mediavida.com never exceeds
+// pollRatePerSec no matter how many workers are running. On shutdown (stop
+// closed) it discards the remaining queued jobs without scraping.
+func (bp *BubblesPoller) pollWorker(stop <-chan struct{}, ch <-chan pollJobArgs) {
+	defer bp.pollWG.Done()
+	for args := range ch {
+		select {
+		case <-stop:
+			bp.clearInflight(args.ClientID) // shutting down — drop without scraping
+			continue
+		case <-bp.pollLimiterC():
+		}
+		bp.handlePollSession(args)
+		bp.clearInflight(args.ClientID)
+	}
+}
+
+// pollLimiterC snapshots the limiter channel under the lock (Stop nils the
+// ticker); a nil channel blocks forever, which is fine because Stop has already
+// closed stopCh so the select's stop arm fires.
+func (bp *BubblesPoller) pollLimiterC() <-chan time.Time {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	if bp.pollLimiter == nil {
+		return nil
+	}
+	return bp.pollLimiter.C
+}
+
+// handlePollSession is the poll-job handler. It resolves the session by
+// clientID and runs the same per-session scrape checkOne did before. If the
+// session is gone or no longer authenticated the job is a no-op.
+func (bp *BubblesPoller) handlePollSession(args pollJobArgs) {
 	s := bp.sessions.Get(args.ClientID)
 	if s == nil || s.Status != "authenticated" || s.Scraper == nil {
-		return nil // session not here / not authed — nothing to scrape, not an error
+		return // session gone / not authed — nothing to scrape
 	}
 	bp.checkOne(args.ClientID, s, args.Save, args.Refresh)
-	return nil
 }
 
 // checkOne polls one session: honors the per-session circuit breaker, runs the

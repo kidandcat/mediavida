@@ -18,7 +18,7 @@ class AppConfig {
   static const appKey = String.fromEnvironment('MV_APP_KEY',
       defaultValue: 'mvapp_8f149532c666c107ebdae87d6fba5fe9fce182d45f81e5e5');
   static const _defaultUrl =
-      String.fromEnvironment('MV_API_URL', defaultValue: 'https://mediavida-api.fly.dev');
+      String.fromEnvironment('MV_API_URL', defaultValue: 'https://mediavida.jairo.cloud');
 
   /// The hardcoded backend base URL (for non-config consumers like push).
   static String get apiBaseUrl => _defaultUrl;

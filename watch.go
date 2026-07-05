@@ -7,14 +7,14 @@ import (
 )
 
 // WatchTokenStore is the durable registry of paired-watch tokens, backed by
-// Colmena. Each token aliases its owner's MV session (see SessionStore.
+// the durable SQLite store. Each token aliases its owner's MV session (see SessionStore.
 // CreateWatchAlias) so a watch can fetch /bubbles autonomously after pairing.
 type WatchTokenStore struct {
-	cs *ColmenaStore
+	cs *Store
 }
 
-// NewWatchTokenStore builds a watch-token store backed by the Colmena cluster.
-func NewWatchTokenStore(cs *ColmenaStore) *WatchTokenStore {
+// NewWatchTokenStore builds a watch-token store backed by the durable SQLite store.
+func NewWatchTokenStore(cs *Store) *WatchTokenStore {
 	return &WatchTokenStore{cs: cs}
 }
 

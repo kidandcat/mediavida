@@ -9,15 +9,15 @@ import (
 	"time"
 )
 
-// WebhookStore manages one webhook URL per MV username, backed by Colmena (Raft).
+// WebhookStore manages one webhook URL per MV username, backed by the durable SQLite store.
 // There is no in-memory map or JSON-on-disk persistence: every read/write goes
 // straight through the durable store.
 type WebhookStore struct {
-	cs *ColmenaStore
+	cs *Store
 }
 
-// NewWebhookStore wires the store to Colmena, the only persistence layer.
-func NewWebhookStore(cs *ColmenaStore) *WebhookStore {
+// NewWebhookStore wires the store to the durable SQLite store, the only persistence layer.
+func NewWebhookStore(cs *Store) *WebhookStore {
 	return &WebhookStore{cs: cs}
 }
 
@@ -37,7 +37,7 @@ func (ws *WebhookStore) Remove(username string) {
 
 // Get returns the webhook URL for a user, or empty string if none.
 //
-// The Colmena core exposes no direct GetWebhook lookup, so this reads the full
+// The Store exposes no direct GetWebhook lookup, so this reads the full
 // webhook map via AllWebhooks and indexes it by username.
 func (ws *WebhookStore) Get(username string) string {
 	all, err := ws.cs.AllWebhooks()

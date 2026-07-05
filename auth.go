@@ -158,7 +158,7 @@ func APITokenMiddleware(validTokens map[string]bool, sessions *SessionStore, wat
 		if !validTokens[token] {
 			// A transient session-store failure must NOT be reported as an
 			// invalid token (which logs the app out). This middleware gates EVERY
-			// request, so a momentary Colmena blip here would otherwise sign every
+			// request, so a momentary store blip here would otherwise sign every
 			// device out at once. Map it to a retryable 503 instead.
 			sess, err := lookupSession(sessions, token)
 			if errors.Is(err, errSessionStoreUnavailable) {

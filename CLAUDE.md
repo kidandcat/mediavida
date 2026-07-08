@@ -31,14 +31,24 @@ firebase --account kidandcat@gmail.com <cmd>   # or pass it per-command
 Never create the mediavida Firebase project, FCM config, or GCP resources under
 the work account.
 
-## Infrastructure (Fly.io, personal)
+## Infrastructure (vps2, personal)
 
-- **`mediavida-api`** — the REST API / scraper backend.
-- **`mediavida-ntfy`** — self-hosted ntfy for push (see `deploy/ntfy/README.md`).
+- **`mediavida.service`** on vps2 — the REST API / scraper backend, behind Caddy at
+  `https://mediavida.jairo.cloud`. Env: `/etc/mediavida/mediavida.env`.
+- **ntfy** — legacy push path, disabled (the `mediavida-ntfy` Fly app is gone). The app
+  only uses FCM.
 - **Firebase project `mediavida-push`** (personal account) — FCM for push.
-  Service account `fcm-sender@mediavida-push…` → key in `mediavida-api` secret
-  `FCM_SA_JSON` (+ `FCM_PROJECT_ID`). Client config (`google-services.json`,
+  Service account `fcm-sender@mediavida-push…` → env var `FCM_SA_JSON`
+  (+ `FCM_PROJECT_ID`). Client config (`google-services.json`,
   `firebase_options.dart`, plist) is committed — those are public client keys.
+- **Gotcha:** systemd `EnvironmentFile` has no multiline values and eats backslashes in
+  unquoted values. `FCM_SA_JSON` must be a **single line wrapped in single quotes**
+  (compact JSON, `\n` inside `private_key` kept literal). Unquoted → `\n` becomes `n`
+  and the PEM is corrupt; multiline → the value truncates to `{`. Either way
+  `[fcm] disabled` / bad-service-account at startup, and since the bubbles poller is
+  gated on "someone is listening" (`fcm.HasTokens`), it stops scraping entirely and no
+  notification of any kind is delivered. Check with `journalctl -u mediavida | grep fcm`
+  → must say `[fcm] enabled for project mediavida-push`.
 
 ## Push notifications
 

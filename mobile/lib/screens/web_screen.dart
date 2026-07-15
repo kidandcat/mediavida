@@ -95,10 +95,18 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     // Android: wire the file chooser so `<input type="file">` (image uploads,
     // attachments) opens a native picker — the WebView does nothing on its own.
     // iOS/WKWebView handles file inputs natively, so this is Android-only.
+    // Android: also render the browser's native JS dialogs — alert/confirm/
+    // prompt. webview_flutter shows none of these by default, so a confirm()
+    // silently returns "cancel" and an alert()/prompt() never appears, which
+    // makes MV actions gated on a confirmation do nothing. iOS/WKWebView shows
+    // them natively.
     if (Platform.isAndroid) {
       final platform = _controller.platform;
       if (platform is AndroidWebViewController) {
         platform.setOnShowFileSelector(_onShowFileSelector);
+        platform.setOnJavaScriptAlertDialog(_onJsAlert);
+        platform.setOnJavaScriptConfirmDialog(_onJsConfirm);
+        platform.setOnJavaScriptTextInputDialog(_onJsPrompt);
       }
     }
 
@@ -133,6 +141,57 @@ class _WebScreenState extends ConsumerState<WebScreen> {
       debugPrint('[web] file picker failed: $e');
       return const [];
     }
+  }
+
+  /// Render a JS `alert()` as a native dialog and wait for dismissal.
+  Future<void> _onJsAlert(JavaScriptAlertDialogRequest r) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        content: Text(r.message),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Aceptar')),
+        ],
+      ),
+    );
+  }
+
+  /// Render a JS `confirm()` as a native dialog; the return value is what the
+  /// page's `if (confirm(...))` branch sees.
+  Future<bool> _onJsConfirm(JavaScriptConfirmDialogRequest r) async {
+    if (!mounted) return false;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        content: Text(r.message),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Aceptar')),
+        ],
+      ),
+    );
+    return ok ?? false;
+  }
+
+  /// Render a JS `prompt()` as a native text dialog; returns the entered text,
+  /// or an empty string when cancelled.
+  Future<String> _onJsPrompt(JavaScriptTextInputDialogRequest r) async {
+    if (!mounted) return '';
+    final field = TextEditingController(text: r.defaultText ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: r.message.isNotEmpty ? Text(r.message) : null,
+        content: TextField(controller: field, autofocus: true),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+          TextButton(onPressed: () => Navigator.pop(ctx, field.text), child: const Text('Aceptar')),
+        ],
+      ),
+    );
+    field.dispose();
+    return result ?? '';
   }
 
   /// Fetch the backend's MV cookies, inject them into the WebView cookie store,

@@ -1,7 +1,11 @@
+import 'dart:io' show Platform;
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 import '../core/notification_service.dart';
 import '../state/providers.dart';
@@ -20,6 +24,39 @@ class WebScreen extends ConsumerStatefulWidget {
 class _WebScreenState extends ConsumerState<WebScreen> {
   static const _home = 'https://www.mediavida.com';
 
+  // Neutralize the WebView's forced multiple-window support: the plugin sets
+  // setSupportMultipleWindows(true) and provides no onCreateWindow handler, so
+  // any `target="_blank"` link/form or `window.open()` call is silently dropped
+  // — which made MV buttons (reload, send reply, …) do nothing. Re-route
+  // window.open to same-tab navigation and strip target="_blank" (including on
+  // nodes added later), so those interactions work. Idempotent per page.
+  static const _tabFixJs = r'''
+(function(){
+  if (window.__mvTabFix) return; window.__mvTabFix = true;
+  try {
+    window.open = function(u){ try { if (u) window.location.href = u; } catch(e){} return null; };
+  } catch(e){}
+  function strip(root){
+    try {
+      var els = root.querySelectorAll ? root.querySelectorAll('a[target],form[target]') : [];
+      for (var i=0;i<els.length;i++){
+        var t = els[i].getAttribute('target');
+        if (t && t.toLowerCase() === '_blank') els[i].removeAttribute('target');
+      }
+    } catch(e){}
+  }
+  function boot(){
+    strip(document);
+    try {
+      new MutationObserver(function(){ strip(document); })
+        .observe(document.documentElement, {childList:true, subtree:true});
+    } catch(e){}
+  }
+  if (document.documentElement) boot();
+  else document.addEventListener('DOMContentLoaded', boot);
+})();
+''';
+
   late final WebViewController _controller;
   final _cookieManager = WebViewCookieManager();
 
@@ -33,12 +70,17 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     super.initState();
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setOnConsoleMessage((m) => debugPrint('[web:${m.level.name}] ${m.message}'))
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) {
           if (mounted) setState(() => _loading = true);
+          // Apply the window.open/target fix as early as possible, before the
+          // page's own scripts cache a reference to window.open.
+          _controller.runJavaScript(_tabFixJs).catchError((_) {});
         },
         onPageFinished: (url) {
           if (mounted) setState(() => _loading = false);
+          _controller.runJavaScript(_tabFixJs).catchError((_) {});
           _maybeSelfHeal(url);
         },
         onWebResourceError: (e) {
@@ -49,6 +91,17 @@ class _WebScreenState extends ConsumerState<WebScreen> {
         },
         onNavigationRequest: _onNavigation,
       ));
+
+    // Android: wire the file chooser so `<input type="file">` (image uploads,
+    // attachments) opens a native picker — the WebView does nothing on its own.
+    // iOS/WKWebView handles file inputs natively, so this is Android-only.
+    if (Platform.isAndroid) {
+      final platform = _controller.platform;
+      if (platform is AndroidWebViewController) {
+        platform.setOnShowFileSelector(_onShowFileSelector);
+      }
+    }
+
     // React to a notification tapped while the app is already running.
     NotificationService().pendingUrl.addListener(_onPendingUrl);
     _boot();
@@ -58,6 +111,28 @@ class _WebScreenState extends ConsumerState<WebScreen> {
   void dispose() {
     NotificationService().pendingUrl.removeListener(_onPendingUrl);
     super.dispose();
+  }
+
+  /// Open a native picker for a WebView `<input type="file">` and hand back the
+  /// chosen file URIs. Honors the accept hint (image-only inputs get the image
+  /// picker) and multiple selection.
+  Future<List<String>> _onShowFileSelector(FileSelectorParams params) async {
+    final imagesOnly = params.acceptTypes.isNotEmpty &&
+        params.acceptTypes.every((t) => t.trim().startsWith('image/'));
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        allowMultiple: params.mode == FileSelectorMode.openMultiple,
+        type: imagesOnly ? FileType.image : FileType.any,
+      );
+      if (result == null) return const [];
+      return result.files
+          .where((f) => f.path != null)
+          .map((f) => Uri.file(f.path!).toString())
+          .toList();
+    } catch (e) {
+      debugPrint('[web] file picker failed: $e');
+      return const [];
+    }
   }
 
   /// Fetch the backend's MV cookies, inject them into the WebView cookie store,
@@ -127,6 +202,7 @@ class _WebScreenState extends ConsumerState<WebScreen> {
   Future<NavigationDecision> _onNavigation(NavigationRequest req) async {
     final uri = Uri.tryParse(req.url);
     if (uri == null) return NavigationDecision.navigate;
+    final scheme = uri.scheme.toLowerCase();
 
     // Explicit MV logout: also drop the backend session (and thus push) and
     // return to the native login screen.
@@ -135,13 +211,17 @@ class _WebScreenState extends ConsumerState<WebScreen> {
       return NavigationDecision.prevent;
     }
 
-    // Keep mediavida.com inside the WebView; send everything else (mailto,
-    // external links, embedded media hosts) to the system browser/app.
-    final inApp = uri.scheme == 'about' ||
-        uri.scheme == 'data' ||
-        uri.host.endsWith('mediavida.com');
-    if (inApp) return NavigationDecision.navigate;
+    // In-page schemes the WebView must handle itself — never hand these to an
+    // external app (doing so is what broke javascript:/blob: driven buttons).
+    const inPageSchemes = {'about', 'data', 'blob', 'javascript', 'filesystem'};
+    if (inPageSchemes.contains(scheme)) return NavigationDecision.navigate;
 
+    // Keep mediavida.com inside the WebView.
+    if ((scheme == 'http' || scheme == 'https') && uri.host.endsWith('mediavida.com')) {
+      return NavigationDecision.navigate;
+    }
+
+    // Everything else (external sites, mailto/tel/intent/…) → system browser/app.
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     }

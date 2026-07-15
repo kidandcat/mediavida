@@ -4,8 +4,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'core/config.dart';
 import 'core/notification_service.dart';
-import 'router.dart';
+import 'screens/setup_screen.dart';
+import 'screens/web_screen.dart';
 import 'state/providers.dart';
 import 'theme.dart';
 
@@ -58,8 +60,6 @@ class MvApp extends ConsumerStatefulWidget {
 }
 
 class _MvAppState extends ConsumerState<MvApp> {
-  late final _router = buildRouter(ref);
-
   @override
   Widget build(BuildContext context) {
     // Subscribe to push while logged in; drop the connection on logout.
@@ -72,13 +72,24 @@ class _MvAppState extends ConsumerState<MvApp> {
       }
     });
 
-    return MaterialApp.router(
+    final cfg = ref.watch(configProvider);
+
+    return MaterialApp(
       title: 'Mediavida',
       debugShowCheckedModeBanner: false,
       theme: MvTheme.light(),
       darkTheme: MvTheme.dark(),
       themeMode: ThemeMode.system,
-      routerConfig: _router,
+      home: _root(cfg),
     );
+  }
+
+  /// Simple auth gate: splash while config loads, then the login screen or the
+  /// WebView depending on whether the backend holds an MV session for us.
+  Widget _root(AppConfig? cfg) {
+    if (cfg == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    return cfg.loggedIn ? const WebScreen() : const SetupScreen();
   }
 }

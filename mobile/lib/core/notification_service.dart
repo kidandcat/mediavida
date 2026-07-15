@@ -27,6 +27,12 @@ class NotificationService with WidgetsBindingObserver {
   final FlutterLocalNotificationsPlugin _local = FlutterLocalNotificationsPlugin();
   static final _rand = Random();
 
+  /// The MV URL of the last tapped notification, if any. The WebView listens to
+  /// this and navigates to the thread when the user opens the app from a push.
+  /// Set from a background/closed tap (getInitialMessage / onMessageOpenedApp)
+  /// and from a foreground tap; consumed (reset to null) by the WebView.
+  final ValueNotifier<String?> pendingUrl = ValueNotifier<String?>(null);
+
   bool _initialized = false;
   String? _deviceToken; // backend bearer, used to register the FCM token
   String? _fcmToken;
@@ -75,8 +81,22 @@ class NotificationService with WidgetsBindingObserver {
     // launcher icon (cold start) fires neither and does NOT emit a `resumed`
     // lifecycle event — that was the case leaving FCM notifications stuck in
     // the tray. An unconditional clear here covers it.
-    FirebaseMessaging.onMessageOpenedApp.listen((_) => clearDelivered());
+    FirebaseMessaging.onMessageOpenedApp.listen((msg) {
+      clearDelivered();
+      _handleTapUrl(msg.data);
+    });
+    // Cold start via a tapped push: the launching message isn't delivered
+    // through the streams above, so pick up its deep-link target here.
+    final initial = await FirebaseMessaging.instance.getInitialMessage();
+    if (initial != null) _handleTapUrl(initial.data);
     await clearDelivered();
+  }
+
+  /// Surface the thread URL carried by a tapped push (avisos/favoritos pushes
+  /// include a `url`) so the WebView can navigate straight to it.
+  void _handleTapUrl(Map<String, dynamic> data) {
+    final url = data['url'];
+    if (url is String && url.isNotEmpty) pendingUrl.value = url;
   }
 
   /// Returning to the foreground means the user has seen their activity — drop

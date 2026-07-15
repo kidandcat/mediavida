@@ -463,6 +463,38 @@ func (s *ForumScraper) SaveSession() {
 	s.mu.Unlock()
 }
 
+// WebCookie is the client-facing shape of an MV cookie, for injecting into the
+// app's embedded WebView so it shares the backend's logged-in session (SSO).
+type WebCookie struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Domain string `json:"domain"`
+	Path   string `json:"path"`
+	Secure bool   `json:"secure"`
+}
+
+// WebCookies returns the current MV cookies for the app to inject into its
+// WebView cookie store, so the embedded browser is logged in as the same user
+// the backend polls for push. Go's cookiejar only preserves name/value on
+// read-back, so domain/path/secure are set to the values MV uses (.mediavida.com,
+// path "/", secure). The jar holds the freshest cookies (kept current by the
+// bubbles poller and reactive re-login), so this is always the live session.
+func (s *ForumScraper) WebCookies() []WebCookie {
+	u, _ := url.Parse("https://www.mediavida.com") // safe-ignore: constant URL, always valid
+	cookies := s.client.Jar.Cookies(u)
+	out := make([]WebCookie, 0, len(cookies))
+	for _, c := range cookies {
+		out = append(out, WebCookie{
+			Name:   c.Name,
+			Value:  c.Value,
+			Domain: ".mediavida.com",
+			Path:   "/",
+			Secure: true,
+		})
+	}
+	return out
+}
+
 // AutoSave saves the session if at least 2 minutes have passed since the last save.
 // Call this after tool operations to keep cookies fresh without excessive disk writes.
 func (s *ForumScraper) AutoSave() {

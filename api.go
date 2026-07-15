@@ -241,6 +241,17 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		writeJSON(w, http.StatusOK, statusResponse{Status: "authenticated", Username: s.Scraper.Username()})
 	})
 
+	// Export the current MV session cookies so the app can inject them into its
+	// embedded WebView and browse mediavida.com logged in as the same account the
+	// backend polls for push (single sign-on). Requires an authenticated session.
+	mux.HandleFunc("GET /auth/mv-cookies", func(w http.ResponseWriter, r *http.Request) {
+		scraper, _ := requireAuthenticated(w, r, sessions)
+		if scraper == nil {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"cookies": scraper.WebCookies()})
+	})
+
 	mux.HandleFunc("POST /auth/logout", func(w http.ResponseWriter, r *http.Request) {
 		clientID := ClientIDFromContext(r.Context())
 		s := sessions.Get(clientID)

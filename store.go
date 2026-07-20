@@ -76,12 +76,9 @@ func (cs *Store) migrate() error {
 			token     TEXT NOT NULL,
 			PRIMARY KEY (client_id, token)
 		)`,
-		// pending_notifs decouples the in-app "avisos" badge from MV's bn
-		// counter. Enriching a mention push requires fetching /notificaciones,
-		// which marks everything seen on MV (bn→0) before the user has looked.
-		// We mirror the unseen items here so the badge — and the per-thread push
-		// count — survive that side effect; the rows are cleared when the app
-		// opens the notifications feed.
+		// pending_notifs was a mirror of unseen avisos for the in-app badge when
+		// the poller used to mark them seen while enriching pushes. The poller
+		// no longer does that; the table remains for GET /notifications.
 		`CREATE TABLE IF NOT EXISTS pending_notifs (
 			client_id  TEXT NOT NULL,
 			notif_id   TEXT NOT NULL,

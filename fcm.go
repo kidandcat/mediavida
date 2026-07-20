@@ -264,10 +264,10 @@ func (f *FCMSender) HasTokens(clientID string) bool {
 // disabled or the client has no registered tokens.
 //
 // fav and mentions are the per-thread enrichment computed by the poller: when
-// present, avisos and favoritos are sent as one grouped (replace-in-place) push
-// per thread, naming the thread and showing its count. When enrichment is empty
-// (e.g. the scrape failed) the method falls back to the old count-only push so a
-// real bubble rise is never dropped silently. Private messages stay count-based.
+// present, favoritos (and optionally avisos) are sent as one grouped
+// (replace-in-place) push per thread. Avisos enrichment is currently disabled
+// (fetching /notificaciones marks them seen on MV), so mentions is usually empty
+// and the count-only fallback fires. Private messages stay count-based.
 func (f *FCMSender) NotifyBubbleIncrease(clientID string, prev, current *Bubbles, fav []ThreadActivity, mentions []MentionActivity) {
 	if f == nil || prev == nil || current == nil {
 		return

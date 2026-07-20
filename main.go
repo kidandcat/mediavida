@@ -159,8 +159,8 @@ func main() {
 	watchTokens := NewWatchTokenStore(store)
 	fcmSender := NewFCMSender(fcmTokens)
 
-	// Durable mirror of unseen avisos — decouples the in-app badge from MV's bn,
-	// which the poller clears when it fetches /notificaciones to enrich a push.
+	// Durable mirror of unseen avisos for GET /notifications badge compatibility.
+	// The poller no longer fetches /notificaciones (that marked avisos seen on MV).
 	pendingNotifs := NewPendingNotifStore(store)
 
 	// Start bubbles poller for SSE/webhook push notifications. Mod-forum

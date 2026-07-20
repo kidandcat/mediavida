@@ -879,9 +879,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 		// Capture the unread count BEFORE fetching: visiting /notificaciones
 		// marks everything seen, so afterwards the bubble would read 0. The
 		// newest `unread` items are the unseen ones (feed is newest-first).
-		// The badge is decoupled from MV's bn (the poller may have already
-		// marked avisos seen while enriching a push), so take the larger of
-		// MV's live count and our pending mirror.
+		// Take the larger of MV's live bn and any pending mirror left over.
 		unread := pending.Count(clientID)
 		if b, err := scraper.FetchBubbles(); err == nil && b.Notifications > unread {
 			unread = b.Notifications
@@ -931,9 +929,8 @@ func RegisterAPIRoutes(mux *http.ServeMux, sessions *SessionStore, webhooks *Web
 			writeAPIError(w, err)
 			return
 		}
-		// Avisos badge is decoupled from MV's bn: take the larger of MV's live
-		// count and our pending mirror (the poller may have marked avisos seen
-		// while enriching a push). Cleared when the app opens /notifications.
+		// Avisos badge: larger of MV's live bn and any leftover pending mirror.
+		// Cleared when the app opens /notifications via the API.
 		notifications := b.Notifications
 		if c := pending.Count(clientID); c > notifications {
 			notifications = c

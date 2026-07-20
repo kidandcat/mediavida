@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-// PendingNotifStore is the durable mirror of a device's unseen MV notifications,
-// backed by the durable SQLite store. It exists because enriching a mention push forces us to
-// fetch /notificaciones (which marks everything seen on MV), so the in-app
-// "avisos" badge can no longer be read from MV's bn. The badge is driven from
-// this store instead and cleared when the app opens the notifications feed.
+// PendingNotifStore is a durable mirror of a device's unseen MV notifications,
+// backed by the durable SQLite store. Historically it compensated for the
+// poller marking avisos seen while enriching pushes; the poller no longer does
+// that, so this store is only written when a client opens GET /notifications
+// via the API (and cleared on that same open). Kept for badge compatibility.
 type PendingNotifStore struct {
 	cs *Store
 }

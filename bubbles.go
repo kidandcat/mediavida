@@ -452,23 +452,19 @@ func (bp *BubblesPoller) checkOne(clientID string, s *Session, save, refresh boo
 	trackingFav := len(bp.prevFav[clientID]) > 0
 	bp.stateMu.Unlock()
 
-	// Enrichment (extra MV scrapes to name the thread / mentioning user) only
-	// runs for push-enabled devices, so SSE/web-only clients keep the lighter
-	// path and the aggregate MV request rate stays bounded.
+	// Favorites enrichment (extra MV scrape to name the thread) only runs for
+	// push-enabled devices, so SSE/web-only clients keep the lighter path.
+	// Avisos are intentionally NOT enriched: visiting /notificaciones marks
+	// every aviso as seen on MV, which would clear them on the website (and in
+	// the app WebView). Aviso pushes use the count-only body instead.
 	var favThreads []ThreadActivity
-	var mentions []MentionActivity
 	if bp.fcm.HasTokens(clientID) {
 		// Favorites: fetch when bf rose OR while we are still tracking unread
 		// favorite threads — extra posts in an ALREADY-unread thread don't bump
 		// bf, and that "3 mensajes nuevos en X" case is exactly the point.
+		// /foro/favoritos is non-destructive (does not mark unread as read).
 		if current.Favorites > prev.Favorites || trackingFav {
 			favThreads = bp.enrichFavorites(clientID, scraper)
-		}
-		// Mentions: fetch the feed when bn rose. This marks them seen on MV
-		// (bn→0); enrichMentions mirrors the unseen set into the pending store so
-		// the badge survives, then groups per thread for the push.
-		if current.Notifications > prev.Notifications {
-			mentions = bp.enrichMentions(clientID, scraper, current.Notifications)
 		}
 	}
 
@@ -487,7 +483,7 @@ func (bp *BubblesPoller) checkOne(clientID string, s *Session, save, refresh boo
 		bp.enqueuePush(pushJob{
 			clientID: clientID, username: username,
 			prev: prev, current: current,
-			fav: favThreads, mentions: mentions,
+			fav: favThreads, mentions: nil,
 		})
 	}
 
@@ -528,51 +524,6 @@ func (bp *BubblesPoller) enrichFavorites(clientID string, scraper *ForumScraper)
 		}
 	}
 	bp.prevFav[clientID] = newMap
-	return out
-}
-
-// enrichMentions fetches the notifications feed (marking everything seen on MV),
-// mirrors the unseen items into the pending store so the in-app badge survives,
-// and returns one MentionActivity per thread with the cumulative unseen count
-// (so the per-thread push can be updated in place as more avisos arrive).
-func (bp *BubblesPoller) enrichMentions(clientID string, scraper *ForumScraper, unread int) []MentionActivity {
-	items, err := scraper.FetchNotifications()
-	if err != nil {
-		log.Printf("[bubbles] mentions enrich failed for %s: %v", clientID, err)
-		return nil
-	}
-	// The feed is newest-first; the first `unread` entries are the unseen ones.
-	if unread > len(items) {
-		unread = len(items)
-	}
-	if unread <= 0 {
-		return nil
-	}
-	unseen := items[:unread]
-	bp.pending.Add(clientID, unseen)
-
-	// Cumulative unseen-per-thread from the durable store (covers avisos from
-	// earlier ticks that the user hasn't opened yet).
-	perThread := bp.pending.CountByThread(clientID)
-
-	// One MentionActivity per thread touched this tick, newest item as the face.
-	seen := make(map[string]bool)
-	var out []MentionActivity
-	for _, it := range unseen {
-		key := threadKey(it.URL)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		cnt := perThread[key]
-		if cnt == 0 {
-			cnt = 1
-		}
-		out = append(out, MentionActivity{
-			Key: key, Author: it.Author, Text: it.Text,
-			Target: it.Target, URL: it.URL, Count: cnt,
-		})
-	}
 	return out
 }
 
@@ -882,11 +833,9 @@ func (bp *BubblesPoller) notifyClient(clientID string, bubbles *Bubbles) {
 }
 
 // effectiveNotifications is the avisos badge value the app should show: the
-// larger of MV's live bn and our pending mirror. After we enrich (which marks
-// avisos seen on MV → bn=0) the pending count is the source of truth; before
-// the poller has caught up to a fresh aviso, MV's bn is higher. Either way the
-// badge stays correct, and it clears once the app opens the feed (pending
-// cleared) and MV reports 0. nil-safe (pending store may be unconfigured).
+// larger of MV's live bn and our pending mirror. The poller no longer marks
+// avisos seen (so bn stays live), but GET /notifications still uses pending
+// for clients that open the feed via the API. nil-safe.
 func (bp *BubblesPoller) effectiveNotifications(clientID string, mvBn int) int {
 	if bp.pending == nil {
 		return mvBn

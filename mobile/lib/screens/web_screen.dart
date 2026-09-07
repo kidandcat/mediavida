@@ -9,6 +9,7 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 import '../core/notification_service.dart';
 import '../state/providers.dart';
+import 'web_navigation.dart';
 
 /// The whole app UI: a WebView over the mobile-friendly mediavida.com. The
 /// backend still holds the account's MV session (which drives native push); we
@@ -71,6 +72,13 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setOnConsoleMessage((m) => debugPrint('[web:${m.level.name}] ${m.message}'))
+      // Both Android and iOS need these: WKWebView does not show alert/confirm/
+      // prompt unless WKUIDelegate is wired, and webview_flutter's Android
+      // WebChromeClient is a no-op until the callbacks are set. The previous
+      // Android-only platform hooks left iOS silent.
+      ..setOnJavaScriptAlertDialog(_onJsAlert)
+      ..setOnJavaScriptConfirmDialog(_onJsConfirm)
+      ..setOnJavaScriptTextInputDialog(_onJsPrompt)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) {
           if (mounted) setState(() => _loading = true);
@@ -95,18 +103,10 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     // Android: wire the file chooser so `<input type="file">` (image uploads,
     // attachments) opens a native picker — the WebView does nothing on its own.
     // iOS/WKWebView handles file inputs natively, so this is Android-only.
-    // Android: also render the browser's native JS dialogs — alert/confirm/
-    // prompt. webview_flutter shows none of these by default, so a confirm()
-    // silently returns "cancel" and an alert()/prompt() never appears, which
-    // makes MV actions gated on a confirmation do nothing. iOS/WKWebView shows
-    // them natively.
     if (Platform.isAndroid) {
       final platform = _controller.platform;
       if (platform is AndroidWebViewController) {
         platform.setOnShowFileSelector(_onShowFileSelector);
-        platform.setOnJavaScriptAlertDialog(_onJsAlert);
-        platform.setOnJavaScriptConfirmDialog(_onJsConfirm);
-        platform.setOnJavaScriptTextInputDialog(_onJsPrompt);
       }
     }
 
@@ -148,6 +148,8 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     if (!mounted) return;
     await showDialog<void>(
       context: context,
+      useRootNavigator: true,
+      barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         content: Text(r.message),
         actions: [
@@ -163,6 +165,7 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     if (!mounted) return false;
     final ok = await showDialog<bool>(
       context: context,
+      useRootNavigator: true,
       builder: (ctx) => AlertDialog(
         content: Text(r.message),
         actions: [
@@ -181,6 +184,7 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     final field = TextEditingController(text: r.defaultText ?? '');
     final result = await showDialog<String>(
       context: context,
+      useRootNavigator: true,
       builder: (ctx) => AlertDialog(
         title: r.message.isNotEmpty ? Text(r.message) : null,
         content: TextField(controller: field, autofocus: true),
@@ -249,7 +253,7 @@ class _WebScreenState extends ConsumerState<WebScreen> {
   Future<void> _maybeSelfHeal(String url) async {
     final uri = Uri.tryParse(url);
     if (uri == null) return;
-    final onLoginPage = uri.host.contains('mediavida.com') &&
+    final onLoginPage = isMediavidaHost(uri.host) &&
         uri.path.startsWith('/login') &&
         !uri.path.contains('/salir');
     if (!onLoginPage || _selfHealed) return;
@@ -261,30 +265,31 @@ class _WebScreenState extends ConsumerState<WebScreen> {
   Future<NavigationDecision> _onNavigation(NavigationRequest req) async {
     final uri = Uri.tryParse(req.url);
     if (uri == null) return NavigationDecision.navigate;
-    final scheme = uri.scheme.toLowerCase();
 
-    // Explicit MV logout: also drop the backend session (and thus push) and
-    // return to the native login screen.
-    if (uri.host.contains('mediavida.com') && uri.path.contains('/login/salir')) {
-      await ref.read(configProvider.notifier).signOut();
-      return NavigationDecision.prevent;
+    switch (classifyNavigation(uri, isMainFrame: req.isMainFrame)) {
+      case WebNavAction.stay:
+        return NavigationDecision.navigate;
+      case WebNavAction.signOut:
+        await ref.read(configProvider.notifier).signOut();
+        return NavigationDecision.prevent;
+      case WebNavAction.openExternal:
+        await _openExternal(uri);
+        return NavigationDecision.prevent;
     }
+  }
 
-    // In-page schemes the WebView must handle itself — never hand these to an
-    // external app (doing so is what broke javascript:/blob: driven buttons).
-    const inPageSchemes = {'about', 'data', 'blob', 'javascript', 'filesystem'};
-    if (inPageSchemes.contains(scheme)) return NavigationDecision.navigate;
-
-    // Keep mediavida.com inside the WebView.
-    if ((scheme == 'http' || scheme == 'https') && uri.host.endsWith('mediavida.com')) {
-      return NavigationDecision.navigate;
+  /// Open [uri] in the system browser / handler. Do not gate on
+  /// [canLaunchUrl]: on Android 11+ it returns false unless every scheme is
+  /// listed in `<queries>`, which is exactly how external taps became no-ops
+  /// (prevent + no launch).
+  Future<void> _openExternal(Uri uri) async {
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (ok) return;
+      await launchUrl(uri, mode: LaunchMode.platformDefault);
+    } catch (e) {
+      debugPrint('[web] launchUrl failed for $uri: $e');
     }
-
-    // Everything else (external sites, mailto/tel/intent/…) → system browser/app.
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    }
-    return NavigationDecision.prevent;
   }
 
   @override
